@@ -837,7 +837,6 @@ async fn call_compiler(
 
     // Formulate command
     let mut command = Command::new("cargo");
-    command.env_clear();
     command.env("PATH", env_path);
     if let Some(env_rustflags) = optional_env_rustflags {
         command.env("RUSTFLAGS", env_rustflags);

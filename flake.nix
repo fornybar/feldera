@@ -19,6 +19,7 @@
             bun
             clang
             cmake
+            cyrus_sasl
             dart-sass
             gcc
             jdk
