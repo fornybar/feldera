@@ -23,6 +23,7 @@ default = [
     "with-nexmark",
     "with-pubsub",
     "with-redis",
+    "with-nats",
 ]
 with-kafka = ["rdkafka"]
 with-deltalake = ["deltalake", "deltalake-catalog-unity"]
@@ -62,6 +63,7 @@ awc = { workspace = true, features = [
     "rustls-0_23-webpki-roots",
 ] }
 aws-config = { workspace = true }
+async-nats = { workspace = true }
 async-stream = { workspace = true }
 anyhow = { workspace = true, features = ["backtrace"] }
 bytestring = "1.4.0"
