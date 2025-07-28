@@ -4991,6 +4991,7 @@ version = "0.128.0"
 dependencies = [
  "actix-web",
  "anyhow",
+ "async-nats",
  "chrono",
  "csv",
  "enum-map",
