@@ -1,10 +1,17 @@
-use crate::test::{mock_input_pipeline, wait, DEFAULT_TIMEOUT_MS};
+use crate::test::{
+    init_test_logger, mock_input_pipeline, test_circuit, wait, TestStruct as MainTestStruct,
+    DEFAULT_TIMEOUT_MS,
+};
+use crate::{Controller, PipelineConfig};
 use anyhow::Result as AnyResult;
 use async_nats::{self, jetstream};
+use csv::ReaderBuilder as CsvReaderBuilder;
 use feldera_types::deserialize_without_context;
 use feldera_types::program_schema::Relation;
 use serde::{Deserialize, Serialize};
-use std::{thread::sleep, time::Duration};
+use serde_json;
+use std::{fs::create_dir, thread::sleep, time::Duration};
+use tempfile::TempDir;
 
 #[derive(Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Clone)]
 pub struct TestStruct {
@@ -108,6 +115,520 @@ format:
     Ok(())
 }
 
+#[test]
+fn test_nats_fault_tolerance() -> AnyResult<()> {
+    let stream_name = "ft_test_stream";
+    let subject_name = "ft_test_subject";
+
+    let (_nats_process_guard, nats_url) = util::start_nats_and_get_address()?;
+
+    // Create test data - we'll send this in batches to test checkpointing
+    let batch1_data = [
+        TestStruct::new("msg1".to_string(), true, 1),
+        TestStruct::new("msg2".to_string(), false, 2),
+        TestStruct::new("msg3".to_string(), true, 3),
+    ];
+
+    let batch2_data = [
+        TestStruct::new("msg4".to_string(), false, 4),
+        TestStruct::new("msg5".to_string(), true, 5),
+    ];
+
+    // Setup NATS stream and send first batch
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let client = util::wait_for_nats_ready(&nats_url, Duration::from_secs(5)).await?;
+        let jetstream = jetstream::new(client);
+
+        // Create stream
+        jetstream
+            .create_stream(jetstream::stream::Config {
+                name: stream_name.to_string(),
+                subjects: vec![subject_name.to_string()],
+                storage: jetstream::stream::StorageType::Memory,
+                ..Default::default()
+            })
+            .await?;
+
+        // Send first batch of messages
+        for val in batch1_data.iter() {
+            let ack = jetstream
+                .publish(subject_name, serde_json::to_string(val)?.into())
+                .await?;
+            ack.await?;
+        }
+
+        Ok::<(), anyhow::Error>(())
+    })?;
+
+    let config_str = format!(
+        r#"
+stream: test_input
+transport:
+    name: nats_input
+    config:
+        connection_config:
+            server_url: {nats_url}
+        stream_name: {stream_name}
+        consumer_config:
+            deliver_policy: All
+            subjects: [{subject_name}]
+format:
+    name: json
+    config:
+        update_format: raw
+"#
+    );
+
+    // === PHASE 1: Process first batch and create checkpoint ===
+    println!("Phase 1: Processing first batch");
+
+    let (endpoint1, consumer1, _parser1, zset1) = mock_input_pipeline::<TestStruct, TestStruct>(
+        serde_yaml::from_str(&config_str).unwrap(),
+        Relation::empty(),
+    )
+    .unwrap();
+
+    sleep(Duration::from_millis(10));
+
+    // Start processing
+    endpoint1.extend();
+    wait(
+        || {
+            endpoint1.queue(false);
+            zset1.state().flushed.len() == batch1_data.len()
+        },
+        DEFAULT_TIMEOUT_MS,
+    )
+    .unwrap();
+
+    // Verify first batch was processed correctly
+    for (i, upd) in zset1.state().flushed.iter().enumerate() {
+        assert_eq!(upd.unwrap_insert(), &batch1_data[i]);
+    }
+
+    // Simulate checkpoint by getting the current state
+    endpoint1.queue(false);
+    let _checkpoint_state = zset1.state().flushed.clone();
+
+    // Stop the first endpoint
+    endpoint1.disconnect();
+    drop((endpoint1, consumer1, _parser1, zset1));
+
+    // === PHASE 2: Add more data while "offline" ===
+    println!("Phase 2: Adding second batch while offline");
+
+    rt.block_on(async {
+        let client = util::wait_for_nats_ready(&nats_url, Duration::from_secs(5)).await?;
+        let jetstream = jetstream::new(client);
+
+        // Send second batch of messages
+        for val in batch2_data.iter() {
+            let ack = jetstream
+                .publish(subject_name, serde_json::to_string(val)?.into())
+                .await?;
+            ack.await?;
+        }
+
+        Ok::<(), anyhow::Error>(())
+    })?;
+
+    // === PHASE 3: Resume and process remaining data ===
+    println!("Phase 3: Resuming and processing remaining data");
+
+    let (endpoint2, _consumer2, _parser2, zset2) = mock_input_pipeline::<TestStruct, TestStruct>(
+        serde_yaml::from_str(&config_str).unwrap(),
+        Relation::empty(),
+    )
+    .unwrap();
+
+    sleep(Duration::from_millis(10));
+
+    // Start processing - should resume from where we left off
+    endpoint2.extend();
+
+    // Wait for all messages to be processed (should be batch1 + batch2)
+    let total_expected = batch1_data.len() + batch2_data.len();
+    wait(
+        || {
+            endpoint2.queue(false);
+            zset2.state().flushed.len() == total_expected
+        },
+        DEFAULT_TIMEOUT_MS,
+    )
+    .unwrap();
+
+    // === VERIFICATION ===
+    println!("Verification: Checking all messages processed exactly once");
+
+    // Collect all processed messages
+    let mut all_processed = Vec::new();
+    for upd in zset2.state().flushed.iter() {
+        all_processed.push(upd.unwrap_insert().clone());
+    }
+
+    // Create expected data (batch1 + batch2)
+    let mut expected_data = Vec::new();
+    expected_data.extend_from_slice(&batch1_data);
+    expected_data.extend_from_slice(&batch2_data);
+
+    // Verify all messages were processed exactly once
+    assert_eq!(all_processed.len(), expected_data.len());
+
+    // Sort both vectors for comparison (since order might vary)
+    all_processed.sort_by_key(|item| item.i);
+    let mut expected_sorted = expected_data.clone();
+    expected_sorted.sort_by_key(|item| item.i);
+
+    for (actual, expected) in all_processed.iter().zip(expected_sorted.iter()) {
+        assert_eq!(actual, expected);
+    }
+
+    println!(
+        "✓ Fault tolerance test passed: All {} messages processed exactly once",
+        total_expected
+    );
+
+    endpoint2.disconnect();
+    Ok(())
+}
+
+#[derive(Clone)]
+struct NatsFtTestRound {
+    n_records: usize,
+    do_checkpoint: bool,
+}
+
+impl NatsFtTestRound {
+    fn with_checkpoint(n_records: usize) -> Self {
+        Self {
+            n_records,
+            do_checkpoint: true,
+        }
+    }
+
+    fn without_checkpoint(n_records: usize) -> Self {
+        Self {
+            n_records,
+            do_checkpoint: false,
+        }
+    }
+}
+
+/// Runs a comprehensive test of NATS fault tolerance using the Controller.
+///
+/// The test proceeds in multiple rounds. For each element of `rounds`, the
+/// test writes `n_records` records to the NATS stream, starts the pipeline
+/// and waits for it to process the data. If `do_checkpoint` is true, it
+/// creates a new checkpoint. Then it stops the pipeline, checks that the
+/// output is as expected, and goes on to the next round.
+fn test_nats_ft(rounds: &[NatsFtTestRound]) {
+    init_test_logger();
+
+    let (_nats_process_guard, nats_url) = util::start_nats_and_get_address().unwrap();
+
+    let stream_name = "str";
+    let subject_name = "sub";
+
+    // Setup NATS stream
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let client = util::wait_for_nats_ready(&nats_url, Duration::from_secs(5))
+            .await
+            .unwrap();
+        let jetstream = jetstream::new(client);
+        jetstream
+            .create_stream(jetstream::stream::Config {
+                name: stream_name.to_string(),
+                subjects: vec![subject_name.to_string()],
+                storage: jetstream::stream::StorageType::Memory,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    });
+
+    let tempdir = TempDir::new().unwrap();
+    let tempdir_path = tempdir.path();
+    let storage_dir = tempdir_path.join("storage");
+    create_dir(&storage_dir).unwrap();
+    let output_path = tempdir_path.join("output.csv");
+
+    let config_str = format!(
+        r#"
+name: test
+workers: 4
+storage_config:
+    path: {storage_dir:?}
+storage: true
+fault_tolerance: {{}}
+clock_resolution_usecs: null
+inputs:
+    test_input1:
+        stream: test_input1
+        transport:
+            name: nats_input
+            config:
+                connection_config:
+                    server_url: {nats_url}
+                stream_name: {stream_name}
+                consumer_config:
+                    deliver_policy: All
+                    subjects: [{subject_name}]
+        format:
+            name: json
+            config:
+                update_format: raw
+outputs:
+    test_output1:
+        stream: test_output1
+        transport:
+            name: file_output
+            config:
+                path: {output_path:?}
+        format:
+            name: csv
+"#
+    );
+
+    let config: PipelineConfig = serde_yaml::from_str(&config_str).unwrap();
+
+    // Number of records written to NATS.
+    let mut total_records = 0usize;
+
+    // Number of input records included in the latest checkpoint (always <=
+    // total_records).
+    let mut checkpointed_records = 0usize;
+
+    for (
+        round,
+        NatsFtTestRound {
+            n_records,
+            do_checkpoint,
+        },
+    ) in rounds.iter().cloned().enumerate()
+    {
+        println!(
+            "--- round {round}: add {n_records} records, {} ---",
+            if do_checkpoint {
+                "and checkpoint"
+            } else {
+                "no checkpoint"
+            }
+        );
+
+        // Send records to NATS stream
+        println!(
+            "Writing records {total_records}..{}",
+            total_records + n_records
+        );
+        if n_records > 0 {
+            let nats_url = &nats_url;
+            rt.block_on(async move {
+                let client = util::wait_for_nats_ready(nats_url, Duration::from_secs(5))
+                    .await
+                    .unwrap();
+                let jetstream = jetstream::new(client);
+
+                for id in total_records..total_records + n_records {
+                    let test_struct = MainTestStruct {
+                        id: id as u32,
+                        b: id % 2 == 0,
+                        i: Some(id as i64),
+                        s: format!("msg{}", id),
+                    };
+                    let json_data = serde_json::to_string(&test_struct).unwrap();
+                    println!("Publishing: {}", json_data);
+                    let ack = jetstream
+                        .publish(subject_name, json_data.into())
+                        .await
+                        .unwrap();
+                    let ack_result = ack.await.unwrap();
+                    println!(
+                        "Published message {} with sequence: {}",
+                        id, ack_result.sequence
+                    );
+                }
+                println!("Successfully published {} records to NATS", n_records);
+            });
+            total_records += n_records;
+        }
+
+        // Start pipeline
+        println!("start pipeline");
+        let controller = Controller::with_config(
+            |circuit_config| {
+                Ok(test_circuit::<MainTestStruct>(
+                    circuit_config,
+                    &[],
+                    &[Some("output")],
+                ))
+            },
+            &config,
+            Box::new(|e| {
+                println!("Controller error: {e}");
+                panic!("Controller error: {e}");
+            }),
+        )
+        .unwrap();
+
+        println!("Starting controller...");
+        controller.start();
+        println!("Controller started successfully");
+
+        // Wait for the records that are not in the checkpoint to be
+        // processed or replayed.
+        let expect_n = total_records - checkpointed_records;
+        println!(
+            "wait for {} records {checkpointed_records}..{total_records}",
+            expect_n
+        );
+        let mut last_n = 0;
+        let result = wait(
+            || {
+                let n = controller
+                    .status()
+                    .output_status()
+                    .get(&0)
+                    .unwrap()
+                    .transmitted_records();
+
+                if n > last_n {
+                    println!("received {n} records of {expect_n}");
+                    last_n = n;
+                }
+                n >= expect_n as u64
+            },
+            10_000,
+        );
+
+        if let Err(()) = result {
+            println!(
+                "Controller status:\n{}",
+                serde_json::to_string_pretty(controller.status()).unwrap()
+            );
+            panic!("Failed to receive expected records within timeout");
+        }
+
+        // No more records should arrive, but give the controller some time
+        // to send some more in case there's a bug.
+        sleep(Duration::from_millis(100));
+
+        // Then verify that the number is as expected.
+        let total_transmitted = controller
+            .status()
+            .output_status()
+            .get(&0)
+            .unwrap()
+            .transmitted_records();
+        assert_eq!(total_transmitted, expect_n as u64);
+
+        // Checkpoint, if requested.
+        if do_checkpoint {
+            println!("checkpoint");
+            controller.checkpoint().unwrap();
+        }
+
+        // Stop controller.
+        println!("stop controller");
+        controller.stop().unwrap();
+
+        // Read output and compare. Our output adapter, which is not FT,
+        // truncates the output file to length 0 each time. Therefore, the
+        // output file should contain all the records in
+        // `checkpointed_records..total_records`.
+        let mut actual = CsvReaderBuilder::new()
+            .has_headers(false)
+            .from_path(&output_path)
+            .unwrap()
+            .deserialize::<(MainTestStruct, i32)>()
+            .map(|res| {
+                let (val, weight) = res.unwrap();
+                assert_eq!(weight, 1);
+                val
+            })
+            .collect::<Vec<_>>();
+        actual.sort_by_key(|item| item.id);
+
+        assert_eq!(actual.len(), expect_n);
+        for (record, expect_record) in
+            actual
+                .into_iter()
+                .zip((checkpointed_records..).map(|id| MainTestStruct {
+                    id: id as u32,
+                    b: id % 2 == 0,
+                    i: Some(id as i64),
+                    s: format!("msg{}", id),
+                }))
+        {
+            assert_eq!(record, expect_record);
+        }
+
+        if do_checkpoint {
+            checkpointed_records = total_records;
+        }
+        println!();
+    }
+}
+
+#[test]
+fn test_nats_ft_simple() {
+    test_nats_ft(&[NatsFtTestRound::with_checkpoint(5)]);
+}
+
+#[test]
+fn test_nats_ft_with_checkpoints() {
+    test_nats_ft(&[
+        NatsFtTestRound::with_checkpoint(10),
+        NatsFtTestRound::with_checkpoint(15),
+        NatsFtTestRound::with_checkpoint(20),
+    ]);
+}
+
+#[test]
+fn test_nats_ft_without_checkpoints() {
+    test_nats_ft(&[
+        NatsFtTestRound::without_checkpoint(10),
+        NatsFtTestRound::without_checkpoint(15),
+        NatsFtTestRound::without_checkpoint(20),
+    ]);
+}
+
+#[test]
+fn test_nats_ft_alternating() {
+    test_nats_ft(&[
+        NatsFtTestRound::with_checkpoint(10),
+        NatsFtTestRound::without_checkpoint(15),
+        NatsFtTestRound::with_checkpoint(20),
+        NatsFtTestRound::without_checkpoint(10),
+        NatsFtTestRound::with_checkpoint(15),
+    ]);
+}
+
+#[test]
+fn test_nats_ft_initially_zero_without_checkpoint() {
+    test_nats_ft(&[
+        NatsFtTestRound::without_checkpoint(0),
+        NatsFtTestRound::without_checkpoint(10),
+        NatsFtTestRound::without_checkpoint(0),
+        NatsFtTestRound::with_checkpoint(15),
+        NatsFtTestRound::without_checkpoint(10),
+        NatsFtTestRound::with_checkpoint(20),
+    ]);
+}
+
+#[test]
+fn test_nats_ft_initially_zero_with_checkpoint() {
+    test_nats_ft(&[
+        NatsFtTestRound::with_checkpoint(0),
+        NatsFtTestRound::without_checkpoint(10),
+        NatsFtTestRound::without_checkpoint(0),
+        NatsFtTestRound::with_checkpoint(15),
+        NatsFtTestRound::without_checkpoint(10),
+        NatsFtTestRound::with_checkpoint(20),
+    ]);
+}
+
 mod util {
     use crate::test::wait;
     use anyhow::{anyhow, Result as AnyResult};
@@ -189,7 +710,11 @@ mod util {
             let ports_data: PortsData = serde_json::from_str(&port_content)
                 .map_err(|_| anyhow!("Could not parse ports file"))?;
 
-            ports_data.nats.into_iter().next().ok_or(anyhow!("No NATS addresses found in port file"))
+            ports_data
+                .nats
+                .into_iter()
+                .next()
+                .ok_or(anyhow!("No NATS addresses found in port file"))
         }
 
         let nats_addr = get_address_from_ports_file(&port_file_path)?;

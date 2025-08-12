@@ -28,6 +28,7 @@
             pkg-config
             rust-bin.stable.latest.default
             nats-server
+            opencode
           ]
             # FIX for darwin: Provides the mig command used by the build scripts
             ++ pkgs.lib.optional pkgs.stdenv.hostPlatform.isDarwin pkgs.darwin.bootstrap_cmds;
