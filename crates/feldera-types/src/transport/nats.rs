@@ -84,3 +84,11 @@ pub struct NatsInputConfig {
     pub stream_name: String,
     pub consumer_config: ConsumerConfig,
 }
+
+#[derive(Debug, Clone, Eq, PartialEq, Deserialize, Serialize, ToSchema)]
+pub struct NatsOutputConfig {
+    pub connection_config: ConnectOptions,
+    pub subject: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub headers: Option<HashMap<String, String>>,
+}

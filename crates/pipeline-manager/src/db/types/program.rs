@@ -700,6 +700,7 @@ pub fn generate_program_info(
                 TransportConfig::FileOutput(_)
                 | TransportConfig::PostgresOutput(_)
                 | TransportConfig::KafkaOutput(_)
+                | TransportConfig::NatsOutput(_)
                 | TransportConfig::DeltaTableOutput(_)
                 | TransportConfig::RedisOutput(_) => {}
                 _ => {

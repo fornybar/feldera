@@ -66,7 +66,7 @@ use crate::transport::file::{FileInputEndpoint, FileOutputEndpoint};
 use crate::transport::kafka::{KafkaFtInputEndpoint, KafkaFtOutputEndpoint, KafkaOutputEndpoint};
 
 #[cfg(feature = "with-nats")]
-use crate::transport::nats::NatsInputEndpoint;
+use crate::transport::nats::{NatsInputEndpoint, NatsOutputEndpoint};
 
 #[cfg(feature = "with-nexmark")]
 use crate::transport::nexmark::NexmarkEndpoint;
@@ -114,6 +114,7 @@ pub fn input_transport_config_to_endpoint(
         TransportConfig::ClockInput(config) => Box::new(ClockEndpoint::new(config)?),
         TransportConfig::FileOutput(_)
         | TransportConfig::KafkaOutput(_)
+        | TransportConfig::NatsOutput(_)
         | TransportConfig::DeltaTableInput(_)
         | TransportConfig::DeltaTableOutput(_)
         | TransportConfig::PostgresInput(_)
@@ -155,6 +156,10 @@ pub fn output_transport_config_to_endpoint(
         #[cfg(feature = "with-redis")]
         TransportConfig::RedisOutput(config) => {
             Ok(Some(Box::new(RedisOutputEndpoint::new(config)?)))
+        }
+        #[cfg(feature = "with-nats")]
+        TransportConfig::NatsOutput(config) => {
+            Ok(Some(Box::new(NatsOutputEndpoint::new(config)?)))
         }
         _ => Ok(None),
     }

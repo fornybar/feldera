@@ -14,7 +14,7 @@ use crate::transport::file::{FileInputConfig, FileOutputConfig};
 use crate::transport::http::HttpInputConfig;
 use crate::transport::iceberg::IcebergReaderConfig;
 use crate::transport::kafka::{KafkaInputConfig, KafkaOutputConfig};
-use crate::transport::nats::NatsInputConfig;
+use crate::transport::nats::{NatsInputConfig, NatsOutputConfig};
 use crate::transport::nexmark::NexmarkInputConfig;
 use crate::transport::postgres::{PostgresReaderConfig, PostgresWriterConfig};
 use crate::transport::pubsub::PubSubInputConfig;
@@ -1348,6 +1348,7 @@ pub enum TransportConfig {
     FileInput(FileInputConfig),
     FileOutput(FileOutputConfig),
     NatsInput(NatsInputConfig),
+    NatsOutput(NatsOutputConfig),
     KafkaInput(KafkaInputConfig),
     KafkaOutput(KafkaOutputConfig),
     PubSubInput(PubSubInputConfig),
@@ -1377,6 +1378,7 @@ impl TransportConfig {
             TransportConfig::FileInput(_) => "file_input".to_string(),
             TransportConfig::FileOutput(_) => "file_output".to_string(),
             TransportConfig::NatsInput(_) => "nats_input".to_string(),
+            TransportConfig::NatsOutput(_) => "nats_output".to_string(),
             TransportConfig::KafkaInput(_) => "kafka_input".to_string(),
             TransportConfig::KafkaOutput(_) => "kafka_output".to_string(),
             TransportConfig::PubSubInput(_) => "pub_sub_input".to_string(),

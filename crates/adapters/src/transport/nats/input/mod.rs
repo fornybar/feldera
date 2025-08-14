@@ -1,5 +1,5 @@
 mod atomic_option;
-mod config_utils;
+pub mod config_utils; // TODO Move this out, it's used by the output module too
 #[cfg(test)]
 mod test;
 
