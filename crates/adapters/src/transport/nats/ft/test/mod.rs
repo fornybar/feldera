@@ -1,8 +1,9 @@
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use feldera_types::transport::nats::{ConnectOptions, Auth, JetStreamConfig};
-    use std::collections::HashMap;
+    use feldera_types::transport::nats::{ConnectOptions, Auth, JetStreamConfig, NatsOutputConfig};
+    use crate::transport::nats::NatsFtOutputEndpoint;
+    use super::super::output::OutputPosition;
+    use feldera_adapterlib::transport::OutputEndpoint;
 
     fn create_test_config() -> NatsOutputConfig {
         NatsOutputConfig {

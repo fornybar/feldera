@@ -26,23 +26,23 @@ enum FtState {
 }
 
 /// A position in the JetStream output.
-/// 
+///
 /// This tracks both the step and substep within that step for precise ordering.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct OutputPosition {
+pub struct OutputPosition {
     /// The step number.
-    step: Step,
+    pub step: Step,
     /// An index within the step. The first message output in a step has
     /// substep 0, the second has substep 1, and so on.
-    substep: u64,
+    pub substep: u64,
 }
 
 impl OutputPosition {
-    fn new(step: Step) -> Self {
+    pub fn new(step: Step) -> Self {
         Self { step, substep: 0 }
     }
-    
-    fn next_substep(&mut self) {
+
+    pub fn next_substep(&mut self) {
         self.substep += 1;
     }
 }
@@ -63,7 +63,7 @@ impl NatsFtOutputEndpoint {
         // Validate that JetStream is configured for fault tolerance
         let jetstream_config = config.jetstream.as_ref()
             .ok_or_else(|| anyhow!("JetStream configuration required for fault-tolerant NATS output"))?;
-        
+
         if !jetstream_config.enable_fault_tolerance {
             bail!("Fault tolerance must be enabled in JetStream configuration");
         }
@@ -178,7 +178,7 @@ impl NatsFtOutputEndpoint {
         // Get the last message to determine the latest step
         match stream.get_last_raw_message_by_subject(&self.config.subject).await {
             Ok(message) => {
-                // Extract step information from message headers  
+                // Extract step information from message headers
                 if let Some(step_header) = message.headers.get("Feldera-Step") {
                     if let Ok(step_str) = std::str::from_utf8(step_header.as_ref()) {
                         if let Ok(step) = step_str.parse::<Step>() {
@@ -208,7 +208,7 @@ impl NatsFtOutputEndpoint {
             HeaderValue::from(position.step.to_string()),
         );
         header_map.insert(
-            "Feldera-Substep", 
+            "Feldera-Substep",
             HeaderValue::from(position.substep.to_string()),
         );
 
@@ -295,7 +295,7 @@ impl OutputEndpoint for NatsFtOutputEndpoint {
 
     fn batch_start(&mut self, step: Step) -> AnyResult<()> {
         let _guard = self.span();
-        
+
         match self.state {
             FtState::New => {
                 return Err(anyhow!("connect() must be called before batch_start()"));
@@ -418,6 +418,20 @@ impl OutputEndpoint for NatsFtOutputEndpoint {
     }
 }
 
+impl std::fmt::Debug for NatsFtOutputEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NatsFtOutputEndpoint")
+            .field("config", &self.config)
+            .field("client", &self.client.is_some())
+            .field("jetstream", &self.jetstream.is_some())
+            .field("async_error_callback", &self.async_error_callback.is_some())
+            .field("state", &self.state)
+            .field("next_step", &self.next_step)
+            .field("buffered_messages", &self.buffered_messages.len())
+            .finish()
+    }
+}
+
 impl Drop for NatsFtOutputEndpoint {
     fn drop(&mut self) {
         // The async_nats client handles cleanup automatically
@@ -426,8 +440,8 @@ impl Drop for NatsFtOutputEndpoint {
 
 pub fn span(subject: &str, stream: &str) -> EnteredSpan {
     info_span!(
-        "nats_ft_output", 
-        ft = true, 
+        "nats_ft_output",
+        ft = true,
         subject = String::from(subject),
         stream = String::from(stream)
     ).entered()
