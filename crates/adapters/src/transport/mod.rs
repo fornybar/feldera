@@ -66,7 +66,7 @@ use crate::transport::file::{FileInputEndpoint, FileOutputEndpoint};
 use crate::transport::kafka::{KafkaFtInputEndpoint, KafkaFtOutputEndpoint, KafkaOutputEndpoint};
 
 #[cfg(feature = "with-nats")]
-use crate::transport::nats::{NatsInputEndpoint, NatsOutputEndpoint};
+use crate::transport::nats::{NatsInputEndpoint, NatsOutputEndpoint, NatsFtOutputEndpoint};
 
 #[cfg(feature = "with-nexmark")]
 use crate::transport::nexmark::NexmarkEndpoint;
@@ -159,7 +159,12 @@ pub fn output_transport_config_to_endpoint(
         }
         #[cfg(feature = "with-nats")]
         TransportConfig::NatsOutput(config) => {
-            Ok(Some(Box::new(NatsOutputEndpoint::new(config)?)))
+            // Check if JetStream is configured and fault tolerance is enabled
+            if fault_tolerant && config.jetstream.as_ref().map_or(false, |js| js.enable_fault_tolerance) {
+                Ok(Some(Box::new(NatsFtOutputEndpoint::new(config)?)))
+            } else {
+                Ok(Some(Box::new(NatsOutputEndpoint::new(config)?)))
+            }
         }
         _ => Ok(None),
     }

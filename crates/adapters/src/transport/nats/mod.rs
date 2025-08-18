@@ -1,7 +1,9 @@
 //! Transport adapter for NATS
 
 mod input;
-mod output;
+pub mod ft;
+pub mod nonft;
 
 pub use input::NatsInputEndpoint;
-pub use output::NatsOutputEndpoint;
+pub use ft::NatsFtOutputEndpoint;
+pub use nonft::NatsOutputEndpoint;

@@ -86,9 +86,28 @@ pub struct NatsInputConfig {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Deserialize, Serialize, ToSchema)]
+pub struct JetStreamConfig {
+    /// Stream name for JetStream
+    pub stream_name: String,
+    /// Whether to enable fault tolerance using JetStream
+    #[serde(default)]
+    pub enable_fault_tolerance: bool,
+    /// Stream configuration options
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_age: Option<std::time::Duration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_messages: Option<i64>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Deserialize, Serialize, ToSchema)]
 pub struct NatsOutputConfig {
     pub connection_config: ConnectOptions,
     pub subject: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub headers: Option<HashMap<String, String>>,
+    /// JetStream configuration for fault tolerance
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jetstream: Option<JetStreamConfig>,
 }

@@ -152,7 +152,9 @@ impl NatsReader {
         // Handle replay commands
         while let Some((seek_metadata, ())) = command_receiver.recv_replay().await? {
             info!("Attempt to replay: {:?}", seek_metadata);
-            if let Some(sequence_number_range) = seek_metadata.sequence_number_range {
+            let (num_records, hasher) = if let Some(sequence_number_range) =
+                seek_metadata.sequence_number_range
+            {
                 let first_message_offset = sequence_number_range.start();
 
                 let nats_consumer = create_nats_consumer(
@@ -173,13 +175,14 @@ impl NatsReader {
                 .await
                 .with_context(|| format!("While attempting to replay offsets {first_message_offset}..{last_message_offset}"))?;
 
-                consumer.replayed(num_records, hasher.finish());
-
                 read_sequence.store(NonZeroU64::new(last_message_offset + 1), Ordering::Release);
 
+                (num_records, hasher)
             } else {
-                consumer.replayed(0, Xxh3Default::new().finish());
-            }
+                (0, Xxh3Default::new())
+            };
+
+            consumer.replayed(num_records, hasher.finish());
         }
 
         loop {

@@ -1,15 +1,14 @@
 use anyhow::{anyhow, Context, Error as AnyError, Result as AnyResult};
 use async_nats::{self, HeaderMap, HeaderValue};
+use dbsp::circuit::tokio::TOKIO;
 use feldera_adapterlib::transport::{AsyncErrorCallback, OutputEndpoint, Step};
 use feldera_types::transport::nats::NatsOutputConfig;
 use std::str::FromStr;
 use std::sync::Arc;
 use tracing::{info_span, span::EnteredSpan};
 
-use super::input::config_utils::translate_connect_options;
+use super::super::input::config_utils::translate_connect_options;
 
-#[cfg(test)]
-mod test;
 
 /// NATS output endpoint for publishing messages to NATS subjects.
 pub struct NatsOutputEndpoint {
@@ -84,9 +83,8 @@ impl OutputEndpoint for NatsOutputEndpoint {
         let _guard = self.span();
         self.async_error_callback = Some(async_error_callback);
 
-        // Use tokio runtime to connect
-        let rt = tokio::runtime::Handle::current();
-        rt.block_on(self.connect_async())
+        // Use DBSP tokio runtime to connect
+        TOKIO.block_on(self.connect_async())
             .context("Failed to establish NATS connection")?;
 
         Ok(())
@@ -112,9 +110,8 @@ impl OutputEndpoint for NatsOutputEndpoint {
         let subject = &self.config.subject;
         let payload = bytes::Bytes::from(Vec::from(buffer));
 
-        // Publish the message synchronously using tokio runtime
-        let rt = tokio::runtime::Handle::current();
-        rt.block_on(async {
+        // Publish the message synchronously using DBSP tokio runtime
+        TOKIO.block_on(async {
             //if let Some(config_headers) = &self.config.headers {
             //    if !config_headers.is_empty() {
             //        let headers = self.build_headers(&[])?;
@@ -176,8 +173,7 @@ impl OutputEndpoint for NatsOutputEndpoint {
             }
         };
 
-        let rt = tokio::runtime::Handle::current();
-        rt.block_on(async {
+        TOKIO.block_on(async {
             //let header_map = self.build_headers(headers)?;
             //if header_map.is_empty() {
                 client.publish(subject.clone(), payload.into())
