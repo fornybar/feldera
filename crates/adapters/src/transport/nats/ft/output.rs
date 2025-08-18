@@ -74,7 +74,7 @@ impl NatsFtOutputEndpoint {
             jetstream: None,
             async_error_callback: None,
             state: FtState::New,
-            next_step: 0,
+            next_step: 1,
             buffered_messages: Vec::new(),
         })
     }
@@ -189,12 +189,12 @@ impl NatsFtOutputEndpoint {
                 }
                 // If we can't parse the step, start from 0
                 warn!("Could not parse step from last message, starting from step 0");
-                Ok(0)
+                Ok(1)
             }
             Err(_) => {
                 // No messages in stream or other error, start from step 0
                 debug!("No messages in stream or error retrieving last message, starting from step 0");
-                Ok(0)
+                Ok(1)
             }
         }
     }
