@@ -160,7 +160,8 @@ pub fn output_transport_config_to_endpoint(
         #[cfg(feature = "with-nats")]
         TransportConfig::NatsOutput(config) => {
             // Check if JetStream is configured and fault tolerance is enabled
-            if fault_tolerant && config.jetstream.as_ref().map_or(false, |js| js.enable_fault_tolerance) {
+            if true {
+            //if fault_tolerant && config.jetstream.as_ref().map_or(false, |js| js.enable_fault_tolerance) {
                 Ok(Some(Box::new(NatsFtOutputEndpoint::new(config)?)))
             } else {
                 Ok(Some(Box::new(NatsOutputEndpoint::new(config)?)))
