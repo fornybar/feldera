@@ -15,7 +15,10 @@ use async_nats::{
 use atomic_option::AtomicOptionNonZeroU64;
 use config_utils::{translate_connect_options, translate_consumer_options};
 use dbsp::circuit::tokio::TOKIO;
-use feldera_adapterlib::transport::{InputCommandReceiver, Resume};
+use feldera_adapterlib::{
+    format::BufferSize,
+    transport::{InputCommandReceiver, Resume},
+};
 use feldera_types::{
     config::FtModel,
     program_schema::Relation,
@@ -116,7 +119,7 @@ impl NatsReader {
             )
             .instrument(span)
             .await
-            .unwrap_or_else(|e| consumer.error(true, e));
+            .unwrap_or_else(|e| consumer.error(true, e, None));
         });
 
         Ok(Self { command_sender })
@@ -173,12 +176,12 @@ impl NatsReader {
                 .await
                 .with_context(|| format!("While attempting to replay offsets {first_message_offset}..{last_message_offset}"))?;
 
-                consumer.replayed(num_records, hasher.finish());
+                consumer.replayed(BufferSize { records: num_records, bytes: 0 }, hasher.finish());
 
                 read_sequence.store(NonZeroU64::new(last_message_offset + 1), Ordering::Release);
 
             } else {
-                consumer.replayed(0, Xxh3Default::new().finish());
+                consumer.replayed(BufferSize::empty(), Xxh3Default::new().finish());
             }
         }
 
@@ -194,13 +197,13 @@ impl NatsReader {
                         (Some(first), Some(last)) => Some(*first..=*last),
                         _ => None,
                     };
-                    info!("Queued {} records ({sequence_number_range:?})", num_records);
+                    info!("Queued {} records ({sequence_number_range:?})", num_records.records);
                     let seek_metadata = SeekMetadata {
                         sequence_number_range,
                     };
 
                     let seek = serde_json::to_value(seek_metadata)?;
-                    let resume = Resume::new_metadata_only(seek, hasher);
+                    let resume = Resume::new_metadata_only(seek, hasher.map(|h| h.finish()));
 
                     consumer.extended(num_records, Some(resume));
                 }
@@ -280,18 +283,20 @@ async fn consume_nats_messages_until(
                 let info = match message.info() {
                     Ok(info) => info,
                     Err(error) => {
-                        consumer.error(false, anyhow!("Failed to get NATS message info: {error}"));
+                        consumer.error(false, anyhow!("Failed to get NATS message info: {error}"), Some("nats-replay"));
                         continue;
                     }
                 };
                 let data = &message.payload;
                 let (buffer, errors) = parser.parse(&data);
                 consumer.parse_errors(errors);
-                if let Some(mut buffer) = buffer {
+                if let Some(buffer) = buffer {
                     buffer.hash(&mut hasher);
-                    buffer.flush();
+                    // Note: During replay, we only hash the data to verify consistency
+                    // but we don't flush it to avoid re-sending data to the output
                 }
-                consumer.buffered(1, data.len());
+                // Note: During replay, we don't call consumer.buffered() as we're only 
+                // computing hash for consistency check, not actually buffering new data
                 num_records += 1;
                 info!("Got message #{}", info.stream_sequence);
 
@@ -303,7 +308,7 @@ async fn consume_nats_messages_until(
                     }
                 }
             }
-            Err(error) => consumer.error(false, anyhow!("NATS error: {error}")),
+            Err(error) => consumer.error(false, anyhow!("NATS error: {error}"), Some("nats-replay")),
         }
     }
 
@@ -330,7 +335,7 @@ async fn spawn_nats_reader(
                     }
                     result = nats_messages.next() => {
                         let Some(result) = result else {
-                            consumer.error(true, anyhow!("Unexpected end of NATS stream"));
+                            consumer.error(true, anyhow!("Unexpected end of NATS stream"), Some("nats-stream"));
                             return;
                         };
                         match result {
@@ -338,17 +343,17 @@ async fn spawn_nats_reader(
                                 let info = match message.info() {
                                     Ok(info) => info,
                                     Err(error) => {
-                                        consumer.error(false, anyhow!("Failed to get NATS message info: {error}"));
+                                        consumer.error(false, anyhow!("Failed to get NATS message info: {error}"), Some("nats-reader"));
                                         continue;
                                     }
                                 };
                                 info!("Got message #{}", info.stream_sequence);
                                 read_sequence.store(NonZeroU64::new(info.stream_sequence + 1), Ordering::Release);
                                 let data = &message.payload;
-                                queue.push_with_aux(parser.parse(&data), data.len(), info.stream_sequence);
+                                queue.push_with_aux(parser.parse(&data), info.stream_sequence);
                             }
                             Err(error) => {
-                                consumer.error(false, anyhow!("NATS error: {error}"));
+                                consumer.error(false, anyhow!("NATS error: {error}"), Some("nats-reader"));
                             }
                         }
                     }
