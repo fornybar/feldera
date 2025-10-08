@@ -274,6 +274,7 @@ outputs:
                 ))
             },
             &config,
+            std::sync::Weak::new(),
             Box::new(|e| {
                 println!("Controller error: {e}");
                 panic!("Controller error: {e}");
