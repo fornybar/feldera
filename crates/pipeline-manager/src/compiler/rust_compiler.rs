@@ -1608,7 +1608,6 @@ async fn call_compiler(
         .filter(|(key, _)| key.starts_with("SCCACHE"))
         .collect();
 
-    command.env_clear();
     command.env("PATH", env_path);
     if !runtime_selector.is_platform() {
         command.env("FELDERA_RUNTIME_OVERRIDE", runtime_selector.as_commitish());
