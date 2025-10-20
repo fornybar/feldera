@@ -431,6 +431,23 @@ fn test_nats_ft_initially_zero_with_checkpoint() {
     ]);
 }
 
+/// Test for empty queue checkpoint bug.
+///
+/// Scenario: Process data, checkpoint, then checkpoint again with empty queue,
+/// then process more data. Verifies no duplicates or missing data.
+///
+/// The bug would manifest as:
+/// - With bug: `None` checkpoint → can't resume → processes from beginning → 20 records total
+/// - With fix: `Some(6..6)` checkpoint → resumes at 6 → processes 5-14 → 15 records total
+#[test]
+fn test_nats_ft_empty_queue_checkpoint_bug() {
+    test_nats_ft(&[
+        NatsFtTestRound::with_checkpoint(5),   // Process messages 0-4
+        NatsFtTestRound::with_checkpoint(0),   // Empty queue checkpoint (THE BUG)
+        NatsFtTestRound::with_checkpoint(10),  // Process messages 5-14, verify no duplicates
+    ]);
+}
+
 mod util {
     use crate::test::wait;
     use anyhow::{anyhow, Result as AnyResult};
