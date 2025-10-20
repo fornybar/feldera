@@ -44,7 +44,9 @@ type NatsConsumer = nats_consumer::Consumer<NatsConsumerConfig>;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct SeekMetadata {
-    sequence_number_range: Option<std::ops::RangeInclusive<u64>>,
+    /// Half-open range [start, end) where end is exclusive.
+    /// For empty batches, start == end represents the current position.
+    sequence_number_range: Option<std::ops::Range<u64>>,
 }
 
 pub struct NatsInputEndpoint {
@@ -78,7 +80,7 @@ impl TransportInputEndpoint for NatsInputEndpoint {
         info!("Resume info: {:?}", seek_metadata);
         let initial_read_sequence = seek_metadata.and_then(|meta| {
             meta.sequence_number_range
-                .and_then(|range| NonZeroU64::new(range.end() + 1))
+                .and_then(|range| NonZeroU64::new(range.end))
         });
 
         Ok(Box::new(NatsReader::new(
@@ -155,30 +157,37 @@ impl NatsReader {
         while let Some((seek_metadata, ())) = command_receiver.recv_replay().await? {
             info!("Attempt to replay: {:?}", seek_metadata);
             if let Some(sequence_number_range) = seek_metadata.sequence_number_range {
-                let first_message_offset = sequence_number_range.start();
+                if sequence_number_range.is_empty() {
+                    // Empty range [pos, pos) - no messages to replay, just update position
+                    info!("Replaying empty range at position {}", sequence_number_range.start);
+                    consumer.replayed(BufferSize::default(), Xxh3Default::new().finish());
+                    read_sequence.store(NonZeroU64::new(sequence_number_range.start), Ordering::Release);
+                } else {
+                    // Non-empty range - replay messages [start, end)
+                    let first_message_offset = sequence_number_range.start;
 
-                let nats_consumer = create_nats_consumer(
-                    &jetstream,
-                    &nats_consumer_config,
-                    &config.stream_name,
-                    NonZeroU64::new(*first_message_offset),
-                )
-                .await?;
+                    let nats_consumer = create_nats_consumer(
+                        &jetstream,
+                        &nats_consumer_config,
+                        &config.stream_name,
+                        NonZeroU64::new(first_message_offset),
+                    )
+                    .await?;
 
-                let last_message_offset = *sequence_number_range.end();
-                let (hasher, buffer_size) = consume_nats_messages_until(
-                    nats_consumer,
-                    last_message_offset,
-                    consumer.clone(),
-                    parser.fork(),
-                )
-                .await
-                .with_context(|| format!("While attempting to replay offsets {first_message_offset}..{last_message_offset}"))?;
+                    let last_message_offset = sequence_number_range.end - 1;  // Exclusive end
+                    let (hasher, buffer_size) = consume_nats_messages_until(
+                        nats_consumer,
+                        last_message_offset,
+                        consumer.clone(),
+                        parser.fork(),
+                    )
+                    .await
+                    .with_context(|| format!("While attempting to replay offsets {}..{}", first_message_offset, sequence_number_range.end))?;
 
-                consumer.replayed(buffer_size, hasher.finish());
+                    consumer.replayed(buffer_size, hasher.finish());
 
-                read_sequence.store(NonZeroU64::new(last_message_offset + 1), Ordering::Release);
-
+                    read_sequence.store(NonZeroU64::new(sequence_number_range.end), Ordering::Release);
+                }
             } else {
                 consumer.replayed(BufferSize::default(), Xxh3Default::new().finish());
             }
@@ -192,10 +201,24 @@ impl NatsReader {
                 }
                 InputReaderCommand::Queue { .. } => {
                     let (buffer_size, hasher, batches) = queue.flush_with_aux();
+
+                    // Determine sequence_number_range using exclusive end
                     let sequence_number_range = match (batches.first(), batches.last()) {
-                        (Some((_, first)), Some((_, last))) => Some(*first..=*last),
-                        _ => None,
+                        (Some((_, first)), Some((_, last))) => {
+                            // Normal case: we have data
+                            Some(*first..*last + 1)  // Exclusive end: last+1
+                        }
+                        _ => {
+                            // Empty batch: create empty range at current position
+                            read_sequence
+                                .load(Ordering::Acquire)
+                                .map(|nz| {
+                                    let pos = nz.get();
+                                    pos..pos  // Empty range at current position
+                                })
+                        }
                     };
+
                     info!("Queued {:?} records ({sequence_number_range:?})", buffer_size);
                     let seek_metadata = SeekMetadata {
                         sequence_number_range,
