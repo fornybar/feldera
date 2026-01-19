@@ -40,14 +40,16 @@ use crate::{
 use anyhow::{Context, Error as AnyError, Result as AnyResult, anyhow};
 use async_nats::{
     self,
-    jetstream::{self, consumer as nats_consumer},
+    jetstream::{self, consumer as nats_consumer, message::Info as NatsMessageInfo},
 };
 
 use chrono::Utc;
 use config_utils::{translate_connect_options, translate_consumer_options};
 use dbsp::circuit::tokio::TOKIO;
+use feldera_adapterlib::ConnectorMetadata;
 use feldera_adapterlib::format::BufferSize;
 use feldera_adapterlib::transport::{InputCommandReceiver, Resume, Watermark};
+use feldera_sqllib::{ByteArray, SqlString, Timestamp, Variant};
 use feldera_types::{
     config::FtModel,
     program_schema::Relation,
@@ -57,6 +59,7 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::cmp;
+use std::collections::BTreeMap;
 use std::hash::Hasher;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -219,6 +222,7 @@ impl NatsReader {
                     last_message_sequence,
                     consumer.clone(),
                     parser.fork(),
+                    &config,
                 )
                 .await
                 .with_context(|| format!("While attempting to replay sequences {first_message_sequence}..{last_message_sequence}"))?;
@@ -291,6 +295,7 @@ impl NatsReader {
                                 queue.clone(),
                                 consumer.clone(),
                                 parser.fork(),
+                                config.clone(),
                             )
                             .await?,
                         );
@@ -327,11 +332,97 @@ async fn create_nats_consumer(
         .await?)
 }
 
+/// Create record metadata from NATS message containing only properties specified in the connector config.
+fn create_metadata(
+    config: &NatsInputConfig,
+    message: &jetstream::Message,
+    info: &NatsMessageInfo<'_>,
+) -> Option<ConnectorMetadata> {
+    if !config.metadata_requested() {
+        return None;
+    }
+
+    let mut metadata = ConnectorMetadata::new();
+
+    if config.include_subject == Some(true) {
+        metadata.insert(
+            "nats_subject",
+            Variant::String(SqlString::from(message.subject.as_str())),
+        );
+    }
+
+    if config.include_headers == Some(true) {
+        let mut nats_headers = BTreeMap::new();
+
+        if let Some(headers) = &message.headers {
+            for (name, values) in headers.iter() {
+                // NATS headers can have multiple values; we take the first one as bytes
+                let value = values
+                    .iter()
+                    .next()
+                    .map(|v| Variant::Binary(ByteArray::from(v.as_bytes())))
+                    .unwrap_or(Variant::SqlNull);
+                nats_headers.insert(Variant::String(SqlString::from(name.as_str())), value);
+            }
+        }
+
+        metadata.insert(
+            "nats_headers",
+            Variant::Map(std::sync::Arc::new(nats_headers)),
+        );
+    }
+
+    if config.include_stream == Some(true) {
+        metadata.insert("nats_stream", Variant::String(SqlString::from(info.stream)));
+    }
+
+    if config.include_consumer == Some(true) {
+        metadata.insert(
+            "nats_consumer",
+            Variant::String(SqlString::from(info.consumer)),
+        );
+    }
+
+    if config.include_stream_sequence == Some(true) {
+        metadata.insert(
+            "nats_stream_sequence",
+            Variant::BigInt(info.stream_sequence as i64),
+        );
+    }
+
+    if config.include_consumer_sequence == Some(true) {
+        metadata.insert(
+            "nats_consumer_sequence",
+            Variant::BigInt(info.consumer_sequence as i64),
+        );
+    }
+
+    if config.include_delivered == Some(true) {
+        metadata.insert("nats_delivered", Variant::BigInt(info.delivered));
+    }
+
+    if config.include_pending == Some(true) {
+        metadata.insert("nats_pending", Variant::BigInt(info.pending as i64));
+    }
+
+    if config.include_published == Some(true) {
+        // Convert time::OffsetDateTime to milliseconds since epoch for Timestamp
+        let timestamp_millis = info.published.unix_timestamp_nanos() / 1_000_000;
+        metadata.insert(
+            "nats_published",
+            Variant::Timestamp(Timestamp::new(timestamp_millis as i64)),
+        );
+    }
+
+    Some(metadata)
+}
+
 async fn consume_nats_messages_until(
     nats_consumer: NatsConsumer,
     last_message_sequence: u64,
     consumer: Box<dyn InputConsumer>,
     mut parser: Box<dyn Parser>,
+    config: &NatsInputConfig,
 ) -> AnyResult<(Xxh3Default, BufferSize)> {
     let mut nats_messages = nats_consumer.messages().await?;
 
@@ -355,7 +446,8 @@ async fn consume_nats_messages_until(
                     }
                 };
                 let data = &message.payload;
-                let (buffer, errors) = parser.parse(data, None);
+                let metadata = create_metadata(config, &message, &info);
+                let (buffer, errors) = parser.parse(data, metadata);
                 consumer.parse_errors(errors);
                 if let Some(mut buffer) = buffer {
                     buffer.hash(&mut hasher);
@@ -399,6 +491,7 @@ async fn spawn_nats_reader(
     queue: Arc<InputQueue<u64>>,
     consumer: Box<dyn InputConsumer>,
     mut parser: Box<dyn Parser>,
+    config: Arc<NatsInputConfig>,
 ) -> AnyResult<Canceller> {
     let mut nats_messages = nats_consumer.messages().await?;
 
@@ -430,7 +523,8 @@ async fn spawn_nats_reader(
                                 // This is the checkpoint position if we need to restart.
                                 next_sequence.store(info.stream_sequence + 1, Ordering::Release);
                                 let data = &message.payload;
-                                queue.push_with_aux(parser.parse(data, None), Utc::now(), info.stream_sequence);
+                                let metadata = create_metadata(&config, &message, &info);
+                                queue.push_with_aux(parser.parse(data, metadata), Utc::now(), info.stream_sequence);
                             }
                             Err(error) => {
                                 consumer.error(false, anyhow!("NATS error: {error}"), Some("nats-input"));
