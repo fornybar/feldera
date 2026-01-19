@@ -52,6 +52,20 @@ The connector configuration consists of three main sections:
 | `max_bytes`       | integer                 | No       | Maximum bytes per batch |
 | `max_expires`     | duration                | No       | Maximum duration for pull requests |
 
+### Metadata Options
+
+| Property                  | Type    | Required | Description |
+|---------------------------|---------|----------|-------------|
+| `include_subject`         | boolean | No       | Whether to include the message subject in connector metadata (see [Accessing NATS metadata](#metadata)) |
+| `include_headers`         | boolean | No       | Whether to include message headers in connector metadata (see [Accessing NATS metadata](#metadata)) |
+| `include_stream`          | boolean | No       | Whether to include the stream name in connector metadata (see [Accessing NATS metadata](#metadata)) |
+| `include_consumer`        | boolean | No       | Whether to include the consumer name in connector metadata (see [Accessing NATS metadata](#metadata)) |
+| `include_stream_sequence` | boolean | No       | Whether to include the stream sequence number in connector metadata (see [Accessing NATS metadata](#metadata)) |
+| `include_consumer_sequence` | boolean | No     | Whether to include the consumer sequence number in connector metadata (see [Accessing NATS metadata](#metadata)) |
+| `include_delivered`       | boolean | No       | Whether to include the delivery attempt count in connector metadata (see [Accessing NATS metadata](#metadata)) |
+| `include_pending`         | boolean | No       | Whether to include the pending message count in connector metadata (see [Accessing NATS metadata](#metadata)) |
+| `include_published`       | boolean | No       | Whether to include the publish timestamp in connector metadata (see [Accessing NATS metadata](#metadata)) |
+
 #### Deliver Policy
 
 The `deliver_policy` field determines where in the stream to start consuming messages:
@@ -312,6 +326,84 @@ CREATE MATERIALIZED VIEW summary as
     FROM raw_text
     GROUP BY text_length
 ```
+## <a name="metadata"></a>Accessing NATS metadata
+
+NATS JetStream messages include several metadata attributes in addition to the payload. These can be extracted by the NATS connector and accessed from SQL:
+
+| Metadata attribute     | SQL type                 | `CONNECTOR_METADATA()` field | Configuration option      |
+|------------------------|--------------------------|------------------------------|---------------------------|
+| Message subject        | `VARCHAR`                | `nats_subject`               | `include_subject`         |
+| Message headers        | `MAP<STRING, VARBINARY>` | `nats_headers`               | `include_headers`         |
+| Stream name            | `VARCHAR`                | `nats_stream`                | `include_stream`          |
+| Consumer name          | `VARCHAR`                | `nats_consumer`              | `include_consumer`        |
+| Stream sequence        | `BIGINT`                 | `nats_stream_sequence`       | `include_stream_sequence` |
+| Consumer sequence      | `BIGINT`                 | `nats_consumer_sequence`     | `include_consumer_sequence` |
+| Delivery attempts      | `BIGINT`                 | `nats_delivered`             | `include_delivered`       |
+| Pending messages       | `BIGINT`                 | `nats_pending`               | `include_pending`         |
+| Publish timestamp      | `TIMESTAMP`              | `nats_published`             | `include_published`       |
+
+Some applications need to ingest and store these attributes alongside the message payload.
+The steps below describe how to extract and use NATS metadata in SQL tables.
+
+1. **Enable metadata extraction in the NATS connector.**
+   Use the configuration options listed in the table above to enable only the metadata fields your application needs.
+   Extracting unnecessary attributes adds overhead to ingestion and processing.
+
+2. **Use metadata values to populate table columns.**
+   Enabled metadata attributes are exposed via the `CONNECTOR_METADATA()` function, which returns a
+   `VARIANT` containing a map with all selected attributes. You can reference these values in `DEFAULT`
+   expressions to initialize table columns:
+
+```sql
+CREATE TABLE messages_with_metadata (
+    unix BIGINT,
+    text STRING,
+    nats_subject VARCHAR DEFAULT CAST(CONNECTOR_METADATA()['nats_subject'] AS VARCHAR),
+    nats_stream_sequence BIGINT DEFAULT CAST(CONNECTOR_METADATA()['nats_stream_sequence'] AS BIGINT),
+    nats_published TIMESTAMP DEFAULT CAST(CONNECTOR_METADATA()['nats_published'] AS TIMESTAMP),
+    nats_headers MAP<STRING, VARBINARY> DEFAULT CAST(CONNECTOR_METADATA()['nats_headers'] AS MAP<STRING, VARBINARY>)
+) WITH (
+    'materialized' = 'true',
+    'connectors' = '[{
+        "name": "nats_with_metadata",
+        "transport": {
+            "name": "nats_input",
+            "config": {
+                "connection_config": {
+                    "server_url": "nats://nats:4222"
+                },
+                "stream_name": "my_texts",
+                "consumer_config": {
+                    "deliver_policy": "All"
+                },
+                "include_subject": true,
+                "include_stream_sequence": true,
+                "include_published": true,
+                "include_headers": true
+            }
+        },
+        "format": {
+            "name": "json",
+            "config": {
+                "update_format": "raw"
+            }
+        }
+    }]'
+);
+```
+
+### Converting NATS header values to strings
+
+NATS headers can contain arbitrary byte arrays, but in practice they typically hold UTF-8–encoded strings.
+Use the `BIN2UTF8` function to convert binary values to text:
+
+```sql
+CREATE MATERIALIZED VIEW v AS
+SELECT
+  BIN2UTF8(nats_headers['my_header']) AS my_header
+FROM messages_with_metadata;
+```
+
 ## Additional resources
 
 For more information, see:
