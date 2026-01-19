@@ -96,4 +96,82 @@ pub struct NatsInputConfig {
     pub connection_config: ConnectOptions,
     pub stream_name: String,
     pub consumer_config: ConsumerConfig,
+
+    /// Whether to include NATS message subject in the record metadata.
+    ///
+    /// When `true`, the subject is available via the `CONNECTOR_METADATA()` function
+    /// as `nats_subject`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_subject: Option<bool>,
+
+    /// Whether to include NATS message headers in the record metadata.
+    ///
+    /// When `true`, headers are available via the `CONNECTOR_METADATA()` function
+    /// as `nats_headers` (a map of header names to binary values).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_headers: Option<bool>,
+
+    /// Whether to include the JetStream stream name in the record metadata.
+    ///
+    /// When `true`, the stream name is available via the `CONNECTOR_METADATA()` function
+    /// as `nats_stream`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_stream: Option<bool>,
+
+    /// Whether to include the JetStream consumer name in the record metadata.
+    ///
+    /// When `true`, the consumer name is available via the `CONNECTOR_METADATA()` function
+    /// as `nats_consumer`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_consumer: Option<bool>,
+
+    /// Whether to include the JetStream stream sequence number in the record metadata.
+    ///
+    /// When `true`, the stream sequence is available via the `CONNECTOR_METADATA()` function
+    /// as `nats_stream_sequence`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_stream_sequence: Option<bool>,
+
+    /// Whether to include the JetStream consumer sequence number in the record metadata.
+    ///
+    /// When `true`, the consumer sequence is available via the `CONNECTOR_METADATA()` function
+    /// as `nats_consumer_sequence`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_consumer_sequence: Option<bool>,
+
+    /// Whether to include the number of delivery attempts in the record metadata.
+    ///
+    /// When `true`, the delivery count is available via the `CONNECTOR_METADATA()` function
+    /// as `nats_delivered`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_delivered: Option<bool>,
+
+    /// Whether to include the number of pending messages in the record metadata.
+    ///
+    /// When `true`, the pending count is available via the `CONNECTOR_METADATA()` function
+    /// as `nats_pending`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_pending: Option<bool>,
+
+    /// Whether to include the message publish timestamp in the record metadata.
+    ///
+    /// When `true`, the publish timestamp is available via the `CONNECTOR_METADATA()` function
+    /// as `nats_published`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_published: Option<bool>,
+}
+
+impl NatsInputConfig {
+    /// Returns true if any metadata field is requested.
+    pub fn metadata_requested(&self) -> bool {
+        self.include_subject == Some(true)
+            || self.include_headers == Some(true)
+            || self.include_stream == Some(true)
+            || self.include_consumer == Some(true)
+            || self.include_stream_sequence == Some(true)
+            || self.include_consumer_sequence == Some(true)
+            || self.include_delivered == Some(true)
+            || self.include_pending == Some(true)
+            || self.include_published == Some(true)
+    }
 }
