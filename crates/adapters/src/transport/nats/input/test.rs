@@ -5,10 +5,14 @@ use crate::{Controller, PipelineConfig};
 use anyhow::Result as AnyResult;
 use async_nats::{self, jetstream};
 use csv::ReaderBuilder as CsvReaderBuilder;
+use feldera_macros::IsNone;
+use feldera_sqllib::{SqlString, Timestamp, Variant};
+use feldera_types::deserialize_table_record;
 use feldera_types::deserialize_without_context;
 use feldera_types::program_schema::Relation;
 use serde::{Deserialize, Serialize};
 use serde_json;
+use size_of::SizeOf;
 use std::{fs::create_dir, thread::sleep, time::Duration};
 use tempfile::TempDir;
 
@@ -441,6 +445,423 @@ fn test_nats_ft_empty_step_checkpoint() {
         NatsFtTestRound::with_checkpoint(0),
         NatsFtTestRound::with_checkpoint(10),
     ]);
+}
+
+/// Test struct with NATS metadata fields.
+/// Used to test passing of record metadata from NATS connector to deserializer.
+#[derive(
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+    Clone,
+    Hash,
+    SizeOf,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+    IsNone,
+)]
+#[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
+pub struct NatsTestStructMetadata {
+    pub i: i32,
+    pub nats_subject: SqlString,
+    pub nats_stream: SqlString,
+    pub nats_stream_sequence: i64,
+    pub nats_consumer_sequence: i64,
+    pub nats_delivered: i64,
+    pub nats_pending: i64,
+    pub nats_published: Timestamp,
+}
+
+deserialize_table_record!(NatsTestStructMetadata["NatsTestStructMetadata", Variant, 8] {
+    (i, "i", false, i32, |_| None),
+    (nats_subject, "nats_subject", false, SqlString, |__feldera_metadata: &Option<Variant>| __feldera_metadata.as_ref().and_then(|metadata| SqlString::try_from(metadata.index_string("nats_subject")).ok())),
+    (nats_stream, "nats_stream", false, SqlString, |__feldera_metadata: &Option<Variant>| __feldera_metadata.as_ref().and_then(|metadata| SqlString::try_from(metadata.index_string("nats_stream")).ok())),
+    (nats_stream_sequence, "nats_stream_sequence", false, i64, |__feldera_metadata: &Option<Variant>| __feldera_metadata.as_ref().and_then(|metadata| i64::try_from(metadata.index_string("nats_stream_sequence")).ok())),
+    (nats_consumer_sequence, "nats_consumer_sequence", false, i64, |__feldera_metadata: &Option<Variant>| __feldera_metadata.as_ref().and_then(|metadata| i64::try_from(metadata.index_string("nats_consumer_sequence")).ok())),
+    (nats_delivered, "nats_delivered", false, i64, |__feldera_metadata: &Option<Variant>| __feldera_metadata.as_ref().and_then(|metadata| i64::try_from(metadata.index_string("nats_delivered")).ok())),
+    (nats_pending, "nats_pending", false, i64, |__feldera_metadata: &Option<Variant>| __feldera_metadata.as_ref().and_then(|metadata| i64::try_from(metadata.index_string("nats_pending")).ok())),
+    (nats_published, "nats_published", false, Timestamp, |__feldera_metadata: &Option<Variant>| __feldera_metadata.as_ref().and_then(|metadata| Timestamp::try_from(metadata.index_string("nats_published")).ok()))
+});
+
+impl NatsTestStructMetadata {
+    pub fn new(
+        i: i32,
+        nats_subject: SqlString,
+        nats_stream: SqlString,
+        nats_stream_sequence: i64,
+        nats_consumer_sequence: i64,
+        nats_delivered: i64,
+        nats_pending: i64,
+        nats_published: Timestamp,
+    ) -> Self {
+        Self {
+            i,
+            nats_subject,
+            nats_stream,
+            nats_stream_sequence,
+            nats_consumer_sequence,
+            nats_delivered,
+            nats_pending,
+            nats_published,
+        }
+    }
+}
+
+/// Test struct with NATS headers metadata.
+/// Used to test headers metadata separately since headers require special handling.
+#[derive(
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+    Clone,
+    Hash,
+    SizeOf,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+    IsNone,
+)]
+#[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
+pub struct NatsTestStructWithHeaders {
+    pub i: i32,
+    pub nats_headers: Variant,
+}
+
+deserialize_table_record!(NatsTestStructWithHeaders["NatsTestStructWithHeaders", Variant, 2] {
+    (i, "i", false, i32, |_| None),
+    (nats_headers, "nats_headers", false, Variant, |__feldera_metadata: &Option<Variant>| __feldera_metadata.as_ref().map(|metadata| metadata.index_string("nats_headers")))
+});
+
+impl NatsTestStructWithHeaders {
+    pub fn new(i: i32, nats_headers: Variant) -> Self {
+        Self { i, nats_headers }
+    }
+}
+
+#[test]
+fn test_nats_metadata_json() -> AnyResult<()> {
+    init_test_logger();
+
+    let stream_name = "metadata_str";
+    let subject_name = "metadata_sub";
+
+    let (_nats_process_guard, nats_url) = util::start_nats_and_get_address()?;
+
+    // Create NATS stream and publish test messages.
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let client = util::wait_for_nats_ready(&nats_url, Duration::from_secs(5)).await?;
+        let jetstream = jetstream::new(client);
+        jetstream
+            .create_stream(jetstream::stream::Config {
+                name: stream_name.to_string(),
+                subjects: vec![subject_name.to_string()],
+                storage: jetstream::stream::StorageType::Memory,
+                ..Default::default()
+            })
+            .await?;
+
+        // Publish two test messages
+        for i in 0..2 {
+            let ack = jetstream
+                .publish(subject_name, format!("{{\"i\": {i}}}").into())
+                .await?;
+            ack.await?;
+        }
+
+        Ok::<(), anyhow::Error>(())
+    })?;
+
+    let config_str = format!(
+        r#"
+stream: test_input
+transport:
+    name: nats_input
+    config:
+        connection_config:
+            server_url: {nats_url}
+        stream_name: {stream_name}
+        consumer_config:
+            deliver_policy: All
+        include_subject: true
+        include_stream: true
+        include_stream_sequence: true
+        include_consumer_sequence: true
+        include_delivered: true
+        include_pending: true
+        include_published: true
+format:
+    name: json
+    config:
+        update_format: raw
+"#
+    );
+
+    println!("Config:\n{}", config_str);
+
+    let (endpoint, _consumer, _parser, zset) =
+        mock_input_pipeline::<NatsTestStructMetadata, NatsTestStructMetadata>(
+            serde_yaml::from_str(&config_str).unwrap(),
+            Relation::empty(),
+        )
+        .unwrap();
+
+    sleep(Duration::from_millis(10));
+
+    // Unpause the endpoint, wait for data.
+    endpoint.extend();
+    wait(
+        || {
+            endpoint.queue(false);
+            zset.state().flushed.len() == 2
+        },
+        DEFAULT_TIMEOUT_MS,
+    )
+    .unwrap();
+
+    let received: Vec<_> = zset
+        .state()
+        .flushed
+        .iter()
+        .map(|upd| upd.unwrap_insert().clone())
+        .collect();
+
+    // Verify metadata fields
+    assert_eq!(received.len(), 2);
+
+    // First message
+    assert_eq!(received[0].i, 0);
+    assert_eq!(received[0].nats_subject, SqlString::from(subject_name));
+    assert_eq!(received[0].nats_stream, SqlString::from(stream_name));
+    assert_eq!(received[0].nats_stream_sequence, 1); // First message is sequence 1
+    assert_eq!(received[0].nats_consumer_sequence, 1);
+    assert_eq!(received[0].nats_delivered, 1); // First delivery attempt
+    assert_eq!(received[0].nats_pending, 1); // One message pending after this one
+    // nats_published should be non-zero (we don't check exact value since it's dynamic)
+    assert!(received[0].nats_published.milliseconds() > 0);
+
+    // Second message
+    assert_eq!(received[1].i, 1);
+    assert_eq!(received[1].nats_subject, SqlString::from(subject_name));
+    assert_eq!(received[1].nats_stream, SqlString::from(stream_name));
+    assert_eq!(received[1].nats_stream_sequence, 2); // Second message is sequence 2
+    assert_eq!(received[1].nats_consumer_sequence, 2);
+    assert_eq!(received[1].nats_delivered, 1);
+    assert_eq!(received[1].nats_pending, 0); // No more messages pending
+    assert!(received[1].nats_published.milliseconds() > 0);
+
+    endpoint.disconnect();
+
+    Ok(())
+}
+
+#[test]
+fn test_nats_metadata_headers() -> AnyResult<()> {
+    init_test_logger();
+
+    let stream_name = "headers_str";
+    let subject_name = "headers_sub";
+
+    let (_nats_process_guard, nats_url) = util::start_nats_and_get_address()?;
+
+    // Create NATS stream and publish test messages with headers.
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let client = util::wait_for_nats_ready(&nats_url, Duration::from_secs(5)).await?;
+        let jetstream = jetstream::new(client);
+        jetstream
+            .create_stream(jetstream::stream::Config {
+                name: stream_name.to_string(),
+                subjects: vec![subject_name.to_string()],
+                storage: jetstream::stream::StorageType::Memory,
+                ..Default::default()
+            })
+            .await?;
+
+        // Publish message with headers
+        let mut headers = async_nats::HeaderMap::new();
+        headers.insert("test-header", "test-value");
+        headers.insert("another-header", "another-value");
+
+        let ack = jetstream
+            .publish_with_headers(subject_name, headers, "{\"i\": 42}".into())
+            .await?;
+        ack.await?;
+
+        // Publish message without headers
+        let ack = jetstream
+            .publish(subject_name, "{\"i\": 43}".into())
+            .await?;
+        ack.await?;
+
+        Ok::<(), anyhow::Error>(())
+    })?;
+
+    let config_str = format!(
+        r#"
+stream: test_input
+transport:
+    name: nats_input
+    config:
+        connection_config:
+            server_url: {nats_url}
+        stream_name: {stream_name}
+        consumer_config:
+            deliver_policy: All
+        include_headers: true
+format:
+    name: json
+    config:
+        update_format: raw
+"#
+    );
+
+    println!("Config:\n{}", config_str);
+
+    let (endpoint, _consumer, _parser, zset) =
+        mock_input_pipeline::<NatsTestStructWithHeaders, NatsTestStructWithHeaders>(
+            serde_yaml::from_str(&config_str).unwrap(),
+            Relation::empty(),
+        )
+        .unwrap();
+
+    sleep(Duration::from_millis(10));
+
+    endpoint.extend();
+    wait(
+        || {
+            endpoint.queue(false);
+            zset.state().flushed.len() == 2
+        },
+        DEFAULT_TIMEOUT_MS,
+    )
+    .unwrap();
+
+    let received: Vec<_> = zset
+        .state()
+        .flushed
+        .iter()
+        .map(|upd| upd.unwrap_insert().clone())
+        .collect();
+
+    assert_eq!(received.len(), 2);
+
+    // First message should have headers
+    assert_eq!(received[0].i, 42);
+    match &received[0].nats_headers {
+        Variant::Map(headers) => {
+            // Check that our headers are present (values are ByteArray wrapped in Variant::Binary)
+            let test_header_key = Variant::String(SqlString::from("test-header"));
+            let another_header_key = Variant::String(SqlString::from("another-header"));
+            assert!(headers.contains_key(&test_header_key));
+            assert!(headers.contains_key(&another_header_key));
+        }
+        _ => panic!("Expected nats_headers to be a Map variant"),
+    }
+
+    // Second message should have empty headers map
+    assert_eq!(received[1].i, 43);
+    match &received[1].nats_headers {
+        Variant::Map(headers) => {
+            assert!(headers.is_empty());
+        }
+        _ => panic!("Expected nats_headers to be a Map variant"),
+    }
+
+    endpoint.disconnect();
+
+    Ok(())
+}
+
+#[test]
+fn test_nats_metadata_not_requested() -> AnyResult<()> {
+    // Test that when no metadata flags are set, the connector still works normally.
+    let stream_name = "no_meta_str";
+    let subject_name = "no_meta_sub";
+
+    let (_nats_process_guard, nats_url) = util::start_nats_and_get_address()?;
+
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let client = util::wait_for_nats_ready(&nats_url, Duration::from_secs(5)).await?;
+        let jetstream = jetstream::new(client);
+        jetstream
+            .create_stream(jetstream::stream::Config {
+                name: stream_name.to_string(),
+                subjects: vec![subject_name.to_string()],
+                storage: jetstream::stream::StorageType::Memory,
+                ..Default::default()
+            })
+            .await?;
+
+        let ack = jetstream
+            .publish(
+                subject_name,
+                "{\"s\": \"test\", \"b\": true, \"i\": 100}".into(),
+            )
+            .await?;
+        ack.await?;
+
+        Ok::<(), anyhow::Error>(())
+    })?;
+
+    let config_str = format!(
+        r#"
+stream: test_input
+transport:
+    name: nats_input
+    config:
+        connection_config:
+            server_url: {nats_url}
+        stream_name: {stream_name}
+        consumer_config:
+            deliver_policy: All
+format:
+    name: json
+    config:
+        update_format: raw
+"#
+    );
+
+    let (endpoint, _consumer, _parser, zset) =
+        mock_input_pipeline::<NatsTestRecord, NatsTestRecord>(
+            serde_yaml::from_str(&config_str).unwrap(),
+            Relation::empty(),
+        )
+        .unwrap();
+
+    sleep(Duration::from_millis(10));
+
+    endpoint.extend();
+    wait(
+        || {
+            endpoint.queue(false);
+            zset.state().flushed.len() == 1
+        },
+        DEFAULT_TIMEOUT_MS,
+    )
+    .unwrap();
+
+    let state = zset.state();
+    let received = state.flushed[0].unwrap_insert();
+    assert_eq!(received.s, "test");
+    assert!(received.b);
+    assert_eq!(received.i, 100);
+
+    endpoint.disconnect();
+
+    Ok(())
 }
 
 mod util {

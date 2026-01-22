@@ -360,9 +360,12 @@ fn create_metadata(
                 let value = values
                     .iter()
                     .next()
-                    .map(|v| Variant::Binary(ByteArray::from(v.as_bytes())))
+                    .map(|v| Variant::Binary(ByteArray::from(AsRef::<[u8]>::as_ref(v))))
                     .unwrap_or(Variant::SqlNull);
-                nats_headers.insert(Variant::String(SqlString::from(name.as_str())), value);
+                nats_headers.insert(
+                    Variant::String(SqlString::from(AsRef::<str>::as_ref(name))),
+                    value,
+                );
             }
         }
 
