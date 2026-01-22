@@ -21,13 +21,14 @@
             cmake
             cyrus_sasl
             dart-sass
-            gcc
+#            gcc
             jdk
             maven
             openssl
             pkg-config
             rust-bin.stable.latest.default
             nats-server
+            go
 #            llvmPackages.libclang
 #            llvmPackages.bintools
 #            zstd
@@ -35,11 +36,15 @@
             # FIX for darwin: Provides the mig command used by the build scripts
             ++ pkgs.lib.optional pkgs.stdenv.hostPlatform.isDarwin pkgs.darwin.bootstrap_cmds;
 
-          # FIX until new relase of jemallocator:  https://github.com/tikv/jemallocator/pull/116
-          CFLAGS=pkgs.lib.optional pkgs.stdenv.hostPlatform.isx86_64 "-DJEMALLOC_STRERROR_R_RETURNS_CHAR_WITH_GNU_SOURCE";
-
+            # FIX until new relase of jemallocator:  https://github.com/tikv/jemallocator/pull/116
+#           CFLAGS=pkgs.lib.optional pkgs.stdenv.hostPlatform.isx86_64 "-DJEMALLOC_STRERROR_R_RETURNS_CHAR_WITH_GNU_SOURCE";
+ 
           shellHook = ''
             export LIBCLANG_PATH="${pkgs.llvmPackages.libclang.lib}/lib";
+            export CC=clang;
+            export AWS_LC_FIPS_SYS_CC=clang;
+            # Combine jemalloc fix with clang warning suppressions
+            export CFLAGS="-DJEMALLOC_STRERROR_R_RETURNS_CHAR_WITH_GNU_SOURCE -Wno-unused-command-line-argument -Wno-error=unterminated-string-initialization";
 #           export ZSTD_SYS_USE_PKG_CONFIG=1;
           '';
         };
