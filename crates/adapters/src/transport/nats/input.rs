@@ -322,6 +322,20 @@ async fn create_nats_consumer(
         };
     }
 
+    // Always generate a unique consumer name to avoid "consumer already exists" errors.
+    // This can happen during:
+    // - Parallel replay operations with the same configured name but different sequences
+    // - Rapid pipeline restarts before the previous consumer expires (inactive_threshold)
+    // - Multiple inputs sharing the same consumer name configuration
+    //
+    // Since we use ordered consumers (ephemeral, no acks), each consumer instance is
+    // independent and doesn't need to share state with previous instances.
+    let suffix = uuid::Uuid::now_v7();
+    consumer_config.name = consumer_config
+        .name
+        .map(|n| format!("{n}_{suffix}"))
+        .or_else(|| Some(format!("feldera_{suffix}")));
+
     Ok(jetstream
         .create_consumer_strict_on_stream(consumer_config, stream_name)
         .await?)

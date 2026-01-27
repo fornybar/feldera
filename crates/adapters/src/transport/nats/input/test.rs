@@ -443,6 +443,280 @@ fn test_nats_ft_empty_step_checkpoint() {
     ]);
 }
 
+/// Test that replay operations with named consumers don't fail with "consumer already exists".
+///
+/// This test reproduces a bug where rapid restart+replay would fail because the
+/// previous ordered consumer (with a user-configured name) hadn't expired yet,
+/// causing "consumer already exists" errors. The fix generates unique names for
+/// replay consumers.
+#[test]
+fn test_nats_ft_rapid_restart_with_named_consumer() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    init_test_logger();
+
+    // Shared flag to detect errors from async tasks
+    let has_error = Arc::new(AtomicBool::new(false));
+
+    let (_nats_process_guard, nats_url) = util::start_nats_and_get_address().unwrap();
+
+    let stream_name = "str";
+    let subject_name = "sub";
+    let consumer_name = "my_named_consumer"; // Explicit consumer name
+
+    // Setup NATS stream
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let client = util::wait_for_nats_ready(&nats_url, Duration::from_secs(5))
+            .await
+            .unwrap();
+        let jetstream = jetstream::new(client);
+        jetstream
+            .create_stream(jetstream::stream::Config {
+                name: stream_name.to_string(),
+                subjects: vec![subject_name.to_string()],
+                storage: jetstream::stream::StorageType::Memory,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    });
+
+    let tempdir = TempDir::new().unwrap();
+    let tempdir_path = tempdir.path();
+    let storage_dir = tempdir_path.join("storage");
+    create_dir(&storage_dir).unwrap();
+    let output_path = tempdir_path.join("output.csv");
+
+    // Config with explicit consumer name
+    let config_str = format!(
+        r#"
+name: test
+workers: 4
+storage_config:
+    path: {storage_dir:?}
+storage: true
+fault_tolerance: {{}}
+clock_resolution_usecs: null
+inputs:
+    test_input1:
+        stream: test_input1
+        transport:
+            name: nats_input
+            config:
+                connection_config:
+                    server_url: {nats_url}
+                stream_name: {stream_name}
+                consumer_config:
+                    name: {consumer_name}
+                    deliver_policy: All
+                    subjects: [{subject_name}]
+        format:
+            name: json
+            config:
+                update_format: raw
+outputs:
+    test_output1:
+        stream: test_output1
+        transport:
+            name: file_output
+            config:
+                path: {output_path:?}
+        format:
+            name: csv
+"#
+    );
+
+    let config: PipelineConfig = serde_yaml::from_str(&config_str).unwrap();
+
+    let n_records = 5;
+
+    // Round 1: Publish messages and checkpoint
+    {
+        println!("--- Round 1: Publish {n_records} messages and checkpoint ---");
+
+        let nats_url = &nats_url;
+        rt.block_on(async move {
+            let client = util::wait_for_nats_ready(nats_url, Duration::from_secs(5))
+                .await
+                .unwrap();
+            let jetstream = jetstream::new(client);
+
+            for id in 0..n_records {
+                let test_struct = TestStruct {
+                    id: id as u32,
+                    b: id % 2 == 0,
+                    i: Some(id as i64),
+                    s: format!("msg{}", id),
+                };
+                let json_data = serde_json::to_string(&test_struct).unwrap();
+                println!("Publishing: {json_data}");
+                let ack = jetstream
+                    .publish(subject_name, json_data.into())
+                    .await
+                    .unwrap();
+                let ack = ack.await.unwrap();
+                println!("Published message {id} with sequence: {}", ack.sequence);
+            }
+            println!("Successfully published {n_records} records to NATS");
+        });
+
+        println!("start pipeline");
+        let has_error_clone = has_error.clone();
+        let controller = Controller::with_test_config(
+            |circuit_config| {
+                Ok(test_circuit::<TestStruct>(
+                    circuit_config,
+                    &[],
+                    &[Some("output")],
+                ))
+            },
+            &config,
+            Box::new(move |e, _tag| {
+                println!("Controller error: {e}");
+                has_error_clone.store(true, Ordering::SeqCst);
+            }),
+        )
+        .unwrap();
+
+        controller.start();
+
+        println!("wait for {n_records} records");
+        wait(
+            || {
+                controller
+                    .status()
+                    .output_status()
+                    .get(&0)
+                    .unwrap()
+                    .transmitted_records() as usize
+                    >= n_records
+            },
+            10_000,
+        )
+        .unwrap();
+
+        println!("checkpoint");
+        controller.checkpoint().unwrap();
+
+        println!("stop controller");
+        controller.stop().unwrap();
+    }
+
+    // Round 2: Rapid restart (no delay) - this triggers the bug
+    // The previous consumer may still exist on the NATS server
+    {
+        println!("--- Round 2: Immediate restart and replay ---");
+
+        // Publish more messages
+        let nats_url = &nats_url;
+        rt.block_on(async move {
+            let client = util::wait_for_nats_ready(nats_url, Duration::from_secs(5))
+                .await
+                .unwrap();
+            let jetstream = jetstream::new(client);
+
+            for id in n_records..n_records * 2 {
+                let test_struct = TestStruct {
+                    id: id as u32,
+                    b: id % 2 == 0,
+                    i: Some(id as i64),
+                    s: format!("msg{}", id),
+                };
+                let json_data = serde_json::to_string(&test_struct).unwrap();
+                println!("Publishing: {json_data}");
+                let ack = jetstream
+                    .publish(subject_name, json_data.into())
+                    .await
+                    .unwrap();
+                let ack = ack.await.unwrap();
+                println!("Published message {id} with sequence: {}", ack.sequence);
+            }
+            println!("Successfully published {n_records} more records to NATS");
+        });
+
+        println!("start pipeline (will replay from checkpoint)");
+        // Before the fix, this would fail with "consumer already exists"
+        let has_error_clone = has_error.clone();
+        let controller = Controller::with_test_config(
+            |circuit_config| {
+                Ok(test_circuit::<TestStruct>(
+                    circuit_config,
+                    &[],
+                    &[Some("output")],
+                ))
+            },
+            &config,
+            Box::new(move |e, _tag| {
+                println!("Controller error: {e}");
+                has_error_clone.store(true, Ordering::SeqCst);
+            }),
+        )
+        .unwrap();
+
+        controller.start();
+
+        // Should receive new records after replay
+        println!("wait for {n_records} new records");
+        wait(
+            || {
+                controller
+                    .status()
+                    .output_status()
+                    .get(&0)
+                    .unwrap()
+                    .transmitted_records() as usize
+                    >= n_records
+            },
+            10_000,
+        )
+        .unwrap();
+
+        println!("stop controller");
+        controller.stop().unwrap();
+    }
+
+    // Round 3: Another immediate restart - triple-check the fix works
+    {
+        println!("--- Round 3: Another immediate restart ---");
+
+        println!("start pipeline (will replay again)");
+        let has_error_clone = has_error.clone();
+        let controller = Controller::with_test_config(
+            |circuit_config| {
+                Ok(test_circuit::<TestStruct>(
+                    circuit_config,
+                    &[],
+                    &[Some("output")],
+                ))
+            },
+            &config,
+            Box::new(move |e, _tag| {
+                println!("Controller error: {e}");
+                has_error_clone.store(true, Ordering::SeqCst);
+            }),
+        )
+        .unwrap();
+
+        controller.start();
+
+        // Wait briefly to ensure pipeline starts successfully
+        sleep(Duration::from_millis(500));
+
+        println!("stop controller");
+        controller.stop().unwrap();
+    }
+
+    // Assert no errors occurred during the test
+    assert!(
+        !has_error.load(Ordering::SeqCst),
+        "Controller encountered errors during rapid restarts"
+    );
+
+    println!("Test passed: rapid restarts with named consumer work correctly");
+}
+
 mod util {
     use crate::test::wait;
     use anyhow::{Result as AnyResult, anyhow};
