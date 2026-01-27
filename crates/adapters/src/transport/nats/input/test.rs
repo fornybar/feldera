@@ -443,29 +443,24 @@ fn test_nats_ft_empty_step_checkpoint() {
     ]);
 }
 
-/// Test that replay operations with named consumers don't fail with "consumer already exists".
+/// Helper for rapid restart tests.
 ///
-/// This test reproduces a bug where rapid restart+replay would fail because the
-/// previous ordered consumer (with a user-configured name) hadn't expired yet,
-/// causing "consumer already exists" errors. The fix generates unique names for
-/// replay consumers.
-#[test]
-fn test_nats_ft_rapid_restart_with_named_consumer() {
+/// Tests that rapid restart+replay works correctly. When `consumer_name` is Some,
+/// this reproduces a bug where the previous ordered consumer hadn't expired yet,
+/// causing "consumer already exists" errors. The fix generates unique names.
+fn test_nats_ft_rapid_restart(consumer_name: Option<&str>) {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
     init_test_logger();
 
-    // Shared flag to detect errors from async tasks
     let has_error = Arc::new(AtomicBool::new(false));
 
     let (_nats_process_guard, nats_url) = util::start_nats_and_get_address().unwrap();
 
     let stream_name = "str";
     let subject_name = "sub";
-    let consumer_name = "my_named_consumer"; // Explicit consumer name
 
-    // Setup NATS stream
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         let client = util::wait_for_nats_ready(&nats_url, Duration::from_secs(5))
@@ -489,7 +484,10 @@ fn test_nats_ft_rapid_restart_with_named_consumer() {
     create_dir(&storage_dir).unwrap();
     let output_path = tempdir_path.join("output.csv");
 
-    // Config with explicit consumer name
+    let consumer_name_line = consumer_name
+        .map(|n| format!("name: {n}"))
+        .unwrap_or_default();
+
     let config_str = format!(
         r#"
 name: test
@@ -509,7 +507,7 @@ inputs:
                     server_url: {nats_url}
                 stream_name: {stream_name}
                 consumer_config:
-                    name: {consumer_name}
+                    {consumer_name_line}
                     deliver_policy: All
                     subjects: [{subject_name}]
         format:
@@ -604,12 +602,10 @@ outputs:
         controller.stop().unwrap();
     }
 
-    // Round 2: Rapid restart (no delay) - this triggers the bug
-    // The previous consumer may still exist on the NATS server
+    // Round 2: Rapid restart (no delay) - this triggers the bug for named consumers
     {
         println!("--- Round 2: Immediate restart and replay ---");
 
-        // Publish more messages
         let nats_url = &nats_url;
         rt.block_on(async move {
             let client = util::wait_for_nats_ready(nats_url, Duration::from_secs(5))
@@ -637,7 +633,6 @@ outputs:
         });
 
         println!("start pipeline (will replay from checkpoint)");
-        // Before the fix, this would fail with "consumer already exists"
         let has_error_clone = has_error.clone();
         let controller = Controller::with_test_config(
             |circuit_config| {
@@ -657,7 +652,6 @@ outputs:
 
         controller.start();
 
-        // Should receive new records after replay
         println!("wait for {n_records} new records");
         wait(
             || {
@@ -677,7 +671,7 @@ outputs:
         controller.stop().unwrap();
     }
 
-    // Round 3: Another immediate restart - triple-check the fix works
+    // Round 3: Another immediate restart
     {
         println!("--- Round 3: Another immediate restart ---");
 
@@ -701,20 +695,35 @@ outputs:
 
         controller.start();
 
-        // Wait briefly to ensure pipeline starts successfully
         sleep(Duration::from_millis(500));
 
         println!("stop controller");
         controller.stop().unwrap();
     }
 
-    // Assert no errors occurred during the test
     assert!(
         !has_error.load(Ordering::SeqCst),
         "Controller encountered errors during rapid restarts"
     );
 
-    println!("Test passed: rapid restarts with named consumer work correctly");
+    println!(
+        "Test passed: rapid restarts with {} consumer work correctly",
+        if consumer_name.is_some() {
+            "named"
+        } else {
+            "unnamed"
+        }
+    );
+}
+
+#[test]
+fn test_nats_ft_rapid_restart_with_named_consumer() {
+    test_nats_ft_rapid_restart(Some("my_named_consumer"));
+}
+
+#[test]
+fn test_nats_ft_rapid_restart_with_unnamed_consumer() {
+    test_nats_ft_rapid_restart(None);
 }
 
 mod util {
