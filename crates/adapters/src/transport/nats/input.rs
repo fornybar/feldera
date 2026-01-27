@@ -330,11 +330,11 @@ async fn create_nats_consumer(
     //
     // Since we use ordered consumers (ephemeral, no acks), each consumer instance is
     // independent and doesn't need to share state with previous instances.
-    let suffix = uuid::Uuid::now_v7();
+    // Only add UUID suffix if user explicitly configured a name.
+    // If name is None, NATS automatically generates a random name for ordered consumers.
     consumer_config.name = consumer_config
         .name
-        .map(|n| format!("{n}_{suffix}"))
-        .or_else(|| Some(format!("feldera_{suffix}")));
+        .map(|n| format!("{n}_{}", uuid::Uuid::now_v7()));
 
     Ok(jetstream
         .create_consumer_strict_on_stream(consumer_config, stream_name)
