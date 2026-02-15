@@ -1,7 +1,5 @@
 # See https://pre-commit.com for more information
 # See https://pre-commit.com/hooks.html for more hooks
-default_language_version:
-  rust: 1.91.1
 repos:
   - repo: local
     hooks:
@@ -9,27 +7,27 @@ repos:
         name: Clippy Automatic Fixes
         description: Run the Clippy linter on the package.
         entry: cargo clippy --fix --allow-dirty
-        language: rust
+        language: system
         files: \.rs$
         pass_filenames: false
       - id: cargo-clippy-check
         name: Clippy Check
         description: Run the Clippy linter on the package.
         entry: cargo clippy --locked --no-deps -- -D warnings
-        language: rust
+        language: system
         files: \.rs$
         pass_filenames: false
       - id: cargo-fmt
         name: Cargo Format
         description: Run the Formatter
         entry: cargo fmt --all
-        language: rust
+        language: system
         files: \.rs$
         pass_filenames: false
       - id: cargo-machete
         name: Cargo Machete
         entry: bash -c 'cd crates && cargo machete --fix'
-        language: rust
+        language: system
         files: \.rs$
         pass_filenames: false
       - id: javascript-check
@@ -49,7 +47,7 @@ repos:
       - id: fix-rust-mod-naming
         name: Rust module naming
         entry: scripts/fix-rust-module-naming
-        language: rust
+        language: system
         files: mod\.rs$
         pass_filenames: false
       - id: update-openapi
@@ -64,7 +62,7 @@ repos:
         name: Cargo Documentation
         description: Generate documentation with warnings treated as errors
         entry: bash -c 'RUSTDOCFLAGS="-D warnings" cargo doc --no-deps'
-        language: rust
+        language: system
         files: \.rs$
         pass_filenames: false
   - repo: https://github.com/astral-sh/ruff-pre-commit

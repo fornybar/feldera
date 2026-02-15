@@ -1521,6 +1521,27 @@ async fn call_compiler(
         command.env(key, value);
     }
 
+    // Preserve LIBCLANG_PATH if set, so that bindgen (used by crates like
+    // zstd-sys) can locate libclang.so during compilation.
+    if let Some(libclang_path) = std::env::var_os("LIBCLANG_PATH") {
+        command.env("LIBCLANG_PATH", libclang_path);
+    }
+
+    // Preserve PKG_CONFIG_PATH if set, so that crates like openssl-sys
+    // can locate system libraries via pkg-config.
+    if let Some(pkg_config_path) = std::env::var_os("PKG_CONFIG_PATH") {
+        command.env("PKG_CONFIG_PATH", pkg_config_path);
+    }
+
+    // Preserve CC and CFLAGS if set, so that native C compilation uses
+    // the intended compiler (e.g., clang from Nix) rather than the
+    // system default.
+    for var in ["CC", "CFLAGS"] {
+        if let Some(val) = std::env::var_os(var) {
+            command.env(var, val);
+        }
+    }
+
     command
         // Set compiler stack size to 20MB (10x the default) to prevent
         // SIGSEGV when the compiler runs out of stack on large programs.

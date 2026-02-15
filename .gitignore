@@ -94,3 +94,5 @@ playwright/.cache/
 
 # Claude Code
 /.claude/settings.local.json
+
+.devenv/
