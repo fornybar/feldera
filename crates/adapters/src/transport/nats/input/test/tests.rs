@@ -28,6 +28,227 @@ fn test_nats_basic_input_consumption() -> AnyResult<()> {
         ],
     )
 }
+/// Replay all published records from a fresh pipeline and verify correctness.
+#[test]
+fn test_nats_replay_basic() -> AnyResult<()> {
+    use NatsMockAction::*;
+    run_nats_mock_test(
+        basic_nats_config,
+        &[
+            StartNats,
+            CreateStream,
+            Publish(5),
+            CreatePipeline,
+            Extend,
+            WaitForRecords(5),
+            VerifyRecords {
+                output_index: 0,
+                count: 5,
+            },
+            AssertRecordCount(5),
+            Disconnect,
+            // Replay all 5 records: sequences [1, 6).
+            CreatePipeline,
+            Replay { start: 1, end: 6 },
+            WaitForReplayedRecords(5),
+            Sleep(Duration::from_millis(200)),
+            AssertRecordCount(5),
+            VerifyOutputSlice {
+                output_index: 0,
+                nats_seq: 1,
+                count: 5,
+            },
+            Disconnect,
+        ],
+    )
+}
+
+/// Replay a subset of published records (partial range).
+#[test]
+fn test_nats_replay_partial_range() -> AnyResult<()> {
+    use NatsMockAction::*;
+    run_nats_mock_test(
+        basic_nats_config,
+        &[
+            StartNats,
+            CreateStream,
+            Publish(10),
+            // First pipeline: consume all records.
+            CreatePipeline,
+            Extend,
+            WaitForRecords(10),
+            AssertRecordCount(10),
+            Disconnect,
+            // Second pipeline: replay sequences [3, 8), i.e. sequences 3, 4, 5, 6, 7.
+            CreatePipeline,
+            Replay { start: 3, end: 8 },
+            WaitForReplayedRecords(5),
+            Sleep(Duration::from_millis(200)),
+            AssertRecordCount(5),
+            VerifyOutputSlice {
+                output_index: 0,
+                nats_seq: 3,
+                count: 5,
+            },
+            Disconnect,
+        ],
+    )
+}
+
+/// Replay records then extend to consume new records published after the replay range.
+#[test]
+fn test_nats_replay_then_extend() -> AnyResult<()> {
+    use NatsMockAction::*;
+    run_nats_mock_test(
+        basic_nats_config,
+        &[
+            StartNats,
+            CreateStream,
+            Publish(5),
+            CreatePipeline,
+            Extend,
+            WaitForRecords(5),
+            AssertRecordCount(5),
+            Disconnect,
+            Publish(10),
+            CreatePipeline,
+            Replay { start: 1, end: 6 },
+            WaitForReplayedRecords(5),
+            Sleep(Duration::from_millis(200)),
+            AssertRecordCount(5),
+            VerifyOutputSlice {
+                output_index: 0,
+                nats_seq: 1,
+                count: 5,
+            },
+            // Now extend to consume the 5 new records (sequences [6, 11)).
+            Extend,
+            WaitForRecords(15),
+            AssertRecordCount(15),
+            VerifyOutputSlice {
+                output_index: 5,
+                nats_seq: 6,
+                count: 10,
+            },
+            Disconnect,
+        ],
+    )
+}
+
+/// Replay with an empty range should succeed immediately without errors.
+#[test]
+fn test_nats_replay_empty_range() -> AnyResult<()> {
+    use NatsMockAction::*;
+    run_nats_mock_test(
+        basic_nats_config,
+        &[
+            StartNats,
+            CreateStream,
+            Publish(3),
+            CreatePipeline,
+            // Empty range: start == end (e.g., nothing to replay).
+            Replay { start: 1, end: 1 },
+            // Empty replay produces no records; give the command time to be processed.
+            Sleep(Duration::from_millis(100)),
+            // Verify the empty replay produced exactly zero records.
+            AssertRecordCount(0),
+            // Extend to consume records normally.
+            Extend,
+            WaitForRecords(3),
+            VerifyRecords {
+                output_index: 0,
+                count: 3,
+            },
+            AssertRecordCount(3),
+            Disconnect,
+        ],
+    )
+}
+
+
+/// Multiple sequential replays before extending.
+#[test]
+fn test_nats_replay_multiple_ranges() -> AnyResult<()> {
+    use NatsMockAction::*;
+    run_nats_mock_test(
+        basic_nats_config,
+        &[
+            StartNats,
+            CreateStream,
+            Publish(10),
+            CreatePipeline,
+            Extend,
+            WaitForRecords(10),
+            AssertRecordCount(10),
+            Disconnect,
+            CreatePipeline,
+            Replay { start: 1, end: 4 },
+            WaitForReplayedRecords(3),
+            Sleep(Duration::from_millis(200)),
+            AssertRecordCount(3),
+            VerifyOutputSlice {
+                output_index: 0,
+                nats_seq: 1,
+                count: 3,
+            },
+            Replay { start: 4, end: 8 },
+            WaitForReplayedRecords(7),
+            Sleep(Duration::from_millis(200)),
+            AssertRecordCount(7),
+            VerifyOutputSlice {
+                output_index: 3,
+                nats_seq: 4,
+                count: 4,
+            },
+            Extend,
+            WaitForRecords(10),
+            AssertRecordCount(10),
+            VerifyOutputSlice {
+                output_index: 7,
+                nats_seq: 8,
+                count: 3,
+            },
+            Disconnect,
+        ],
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Disconnect verification
+//
+// Verifies that after calling `Disconnect`, records published to the stream
+// are NOT delivered to the pipeline.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_nats_disconnect_stops_delivery() -> AnyResult<()> {
+    use NatsMockAction::*;
+    run_nats_mock_test(
+        basic_nats_config,
+        &[
+            StartNats,
+            CreateStream,
+            // Publish and consume 3 records.
+            Publish(3),
+            CreatePipeline,
+            Extend,
+            WaitForRecords(3),
+            VerifyRecords {
+                output_index: 0,
+                count: 3,
+            },
+            // Disconnect the endpoint.
+            Disconnect,
+            // Publish 5 more records (indices 3..8) while disconnected.
+            Publish(5),
+            // Give the endpoint time to (incorrectly) receive them.
+            Sleep(Duration::from_millis(500)),
+            // Assert that no new records arrived — still exactly 3.
+            AssertRecordCount(3),
+        ],
+    )
+}
+
 #[test]
 fn test_nats_ft_simple() {
     use NatsControllerAction::*;
