@@ -45,6 +45,10 @@ pub const fn default_request_timeout_secs() -> u64 {
     10
 }
 
+pub const fn default_inactivity_timeout_secs() -> u64 {
+    10
+}
+
 /// Options for connecting to a NATS server.
 #[derive(Debug, Clone, Eq, PartialEq, Deserialize, Serialize, ToSchema)]
 pub struct ConnectOptions {
@@ -120,5 +124,9 @@ pub struct ConsumerConfig {
 pub struct NatsInputConfig {
     pub connection_config: ConnectOptions,
     pub stream_name: String,
+    /// Maximum time in seconds to wait for the next message before running
+    /// a stream/server health check.
+    #[serde(default = "default_inactivity_timeout_secs")]
+    pub inactivity_timeout_secs: u64,
     pub consumer_config: ConsumerConfig,
 }

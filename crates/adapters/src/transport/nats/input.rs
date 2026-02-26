@@ -60,6 +60,7 @@ use std::cmp;
 use std::hash::Hasher;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use tokio::{
     select,
     sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
@@ -261,6 +262,7 @@ impl NatsReader {
         let queue = Arc::new(InputQueue::<u64>::new(consumer.clone()));
         let next_sequence = Arc::new(AtomicU64::new(resume_info.sequence_numbers.end));
         let nats_consumer_config = translate_consumer_options(&config.consumer_config);
+        let inactivity_timeout = Duration::from_secs(config.inactivity_timeout_secs);
 
         let mut command_receiver = InputCommandReceiver::<Metadata, ()>::new(command_receiver);
 
@@ -268,6 +270,9 @@ impl NatsReader {
         while let Some((metadata, ())) = command_receiver.recv_replay().await? {
             info!("Attempt to replay: {:?}", metadata);
             if !metadata.sequence_numbers.is_empty() {
+                validate_replay_range(&jetstream, &config.stream_name, &metadata.sequence_numbers)
+                    .await?;
+
                 let first_message_sequence = metadata.sequence_numbers.start;
 
                 let nats_consumer = create_nats_consumer(
@@ -283,6 +288,9 @@ impl NatsReader {
                 let (hasher, buffer_size) = consume_nats_messages_until(
                     nats_consumer,
                     last_message_sequence,
+                    &jetstream,
+                    &config.stream_name,
+                    inactivity_timeout,
                     consumer.clone(),
                     parser.fork(),
                 )
@@ -355,6 +363,9 @@ impl NatsReader {
                                 nats_consumer,
                                 next_sequence.clone(),
                                 queue.clone(),
+                                jetstream.clone(),
+                                config.stream_name.clone(),
+                                inactivity_timeout,
                                 consumer.clone(),
                                 parser.fork(),
                             )
@@ -414,6 +425,9 @@ async fn create_nats_consumer(
 async fn consume_nats_messages_until(
     nats_consumer: NatsConsumer,
     last_message_sequence: u64,
+    jetstream: &jetstream::Context,
+    stream_name: &str,
+    inactivity_timeout: Duration,
     consumer: Box<dyn InputConsumer>,
     mut parser: Box<dyn Parser>,
 ) -> AnyResult<(Xxh3Default, BufferSize)> {
@@ -422,7 +436,19 @@ async fn consume_nats_messages_until(
     let mut hasher = Xxh3Default::new();
     let mut buffer_size = BufferSize::default();
     loop {
-        let Some(result) = nats_messages.next().await else {
+        let next_result = tokio::time::timeout(inactivity_timeout, nats_messages.next()).await;
+        let Some(result) = (match next_result {
+            Ok(result) => result,
+            Err(_) => {
+                if let Err(error) = NatsReader::verify_stream_exists(jetstream, stream_name).await {
+                    return Err(anyhow!(
+                        "NATS replay stalled for {:?} and stream health check failed: {error:#}",
+                        inactivity_timeout
+                    ));
+                }
+                continue;
+            }
+        }) else {
             return Err(anyhow!("Unexpected end of NATS stream"));
         };
         match result {
@@ -481,6 +507,9 @@ async fn spawn_nats_reader(
     nats_consumer: NatsConsumer,
     next_sequence: Arc<AtomicU64>,
     queue: Arc<InputQueue<u64>>,
+    jetstream: jetstream::Context,
+    stream_name: String,
+    inactivity_timeout: Duration,
     consumer: Box<dyn InputConsumer>,
     mut parser: Box<dyn Parser>,
 ) -> AnyResult<Canceller> {
@@ -495,29 +524,46 @@ async fn spawn_nats_reader(
                     _ = cancel_token_copy.cancelled() => {
                         break;
                     }
-                    result = nats_messages.next() => {
-                        let Some(result) = result else {
-                            consumer.error(true, anyhow!("Unexpected end of NATS stream"), Some("nats-input"));
-                            return;
-                        };
+                    result = tokio::time::timeout(inactivity_timeout, nats_messages.next()) => {
                         match result {
-                            Ok(message) => {
-                                let info = match message.info() {
-                                    Ok(info) => info,
-                                    Err(error) => {
-                                        consumer.error(false, anyhow!("Failed to get NATS message info: {error}"), Some("nats-input"));
-                                        continue;
-                                    }
+                            Ok(result) => {
+                                let Some(result) = result else {
+                                    consumer.error(true, anyhow!("Unexpected end of NATS stream"), Some("nats-input"));
+                                    return;
                                 };
-                                info!("Got message #{}", info.stream_sequence);
-                                // Store the *next* sequence to process for resume tracking.
-                                // This is the checkpoint position if we need to restart.
-                                next_sequence.store(info.stream_sequence + 1, Ordering::Release);
-                                let data = &message.payload;
-                                queue.push_with_aux(parser.parse(data, None), Utc::now(), info.stream_sequence);
+                                match result {
+                                    Ok(message) => {
+                                        let info = match message.info() {
+                                            Ok(info) => info,
+                                            Err(error) => {
+                                                consumer.error(false, anyhow!("Failed to get NATS message info: {error}"), Some("nats-input"));
+                                                continue;
+                                            }
+                                        };
+                                        info!("Got message #{}", info.stream_sequence);
+                                        // Store the *next* sequence to process for resume tracking.
+                                        // This is the checkpoint position if we need to restart.
+                                        next_sequence.store(info.stream_sequence + 1, Ordering::Release);
+                                        let data = &message.payload;
+                                        queue.push_with_aux(parser.parse(data, None), Utc::now(), info.stream_sequence);
+                                    }
+                                    Err(error) => {
+                                        consumer.error(false, anyhow!("NATS error: {error}"), Some("nats-input"));
+                                    }
+                                }
                             }
-                            Err(error) => {
-                                consumer.error(false, anyhow!("NATS error: {error}"), Some("nats-input"));
+                            Err(_) => {
+                                if let Err(error) = NatsReader::verify_stream_exists(&jetstream, &stream_name).await {
+                                    consumer.error(
+                                        true,
+                                        anyhow!(
+                                            "NATS input stalled for {:?} and stream health check failed: {error:#}",
+                                            inactivity_timeout
+                                        ),
+                                        Some("nats-input"),
+                                    );
+                                    return;
+                                }
                             }
                         }
                     }
@@ -530,6 +576,51 @@ async fn spawn_nats_reader(
         cancel_token,
         join_handle,
     })
+}
+
+async fn validate_replay_range(
+    jetstream: &jetstream::Context,
+    stream_name: &str,
+    requested_range: &std::ops::Range<u64>,
+) -> AnyResult<()> {
+    if requested_range.is_empty() {
+        return Ok(());
+    }
+
+    let mut stream = jetstream
+        .get_stream(stream_name)
+        .await
+        .with_context(|| format!("Failed to get stream '{stream_name}'"))?;
+    let stream_info = stream
+        .info()
+        .await
+        .with_context(|| format!("Failed to fetch stream info for '{stream_name}'"))?;
+
+    if stream_info.state.messages == 0 {
+        return Err(anyhow!(
+            "Replay requested sequences {:?} from stream '{stream_name}', but the stream is empty",
+            requested_range
+        ));
+    }
+
+    let requested_first = requested_range.start;
+    let requested_last = requested_range.end - 1;
+    let available_first = stream_info.state.first_sequence;
+    let available_last = stream_info.state.last_sequence;
+
+    if requested_first < available_first || requested_first > available_last {
+        return Err(anyhow!(
+            "Replay start sequence {requested_first} is outside available stream range [{available_first}, {available_last}] for stream '{stream_name}'"
+        ));
+    }
+
+    if requested_last > available_last {
+        return Err(anyhow!(
+            "Replay end sequence {requested_last} exceeds available stream tail {available_last} for stream '{stream_name}'"
+        ));
+    }
+
+    Ok(())
 }
 
 /// Used to instruct a task to shut down, and wait for it to end.
