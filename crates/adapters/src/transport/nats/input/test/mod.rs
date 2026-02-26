@@ -113,6 +113,22 @@ mod util {
         Ok((child, nats_addr))
     }
 
+    pub fn start_nats_on_port(port: u16) -> AnyResult<(ProcessKillGuard, String)> {
+        let nats_ip_addr = "127.0.0.1";
+
+        let child = Command::new("nats-server")
+            .arg("-a")
+            .arg(nats_ip_addr)
+            .arg("-p")
+            .arg(port.to_string())
+            .arg("--jetstream")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+
+        Ok((ProcessKillGuard::new(child), format!("nats://{nats_ip_addr}:{port}")))
+    }
+
     pub async fn create_stream(nats_url: &str, stream: &str, subject: &str) -> AnyResult<()> {
         let client = wait_for_nats_ready(nats_url, Duration::from_secs(5)).await?;
         let js = jetstream::new(client);

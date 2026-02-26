@@ -155,6 +155,55 @@ fn test_nats_quiet_but_healthy_no_false_alarm() -> AnyResult<()> {
     )
 }
 
+/// Tests that a short server outage does not cause a false fatal error if NATS
+/// comes back on the same address before inactivity timeout expires.
+#[test]
+fn test_nats_mid_run_server_restart_recovers_no_fatal() -> AnyResult<()> {
+    use NatsMockAction::*;
+    run_nats_mock_test(
+        nats_stall_config,
+        &[
+            StartNats,
+            CreateStream,
+            Publish(1),
+            CreatePipeline,
+            Extend,
+            WaitForRecords(1),
+            KillServer,
+            RestartNatsSamePort,
+            CreateStream,
+            Publish(5),
+            // At least one post-restart record should be consumed and no fatal error.
+            WaitForRecordsNoFatal(2),
+            DisconnectAllowNonFatal,
+        ],
+    )
+}
+
+/// Tests that inactivity_timeout_secs is honored approximately (with slack).
+#[test]
+fn test_nats_inactivity_timeout_config_is_honored() -> AnyResult<()> {
+    use NatsMockAction::*;
+    run_nats_mock_test(
+        |nats_url| nats_stall_config_with_timeout(nats_url, 1, 2),
+        &[
+            StartNats,
+            CreateStream,
+            Publish(1),
+            CreatePipeline,
+            Extend,
+            WaitForRecords(1),
+            KillServer,
+            // Fatal should not be immediate, and should arrive within a bounded window.
+            ExpectFatalErrorWithin {
+                min: Duration::from_millis(700),
+                max: Duration::from_secs(6),
+            },
+            Disconnect,
+        ],
+    )
+}
+
 /// Replay all published records from a fresh pipeline and verify correctness.
 #[test]
 fn test_nats_replay_basic() -> AnyResult<()> {
@@ -335,6 +384,55 @@ fn test_nats_replay_end_after_last_sequence_fails_fast() -> AnyResult<()> {
             CreatePipeline,
             // Tail is 5, but end-1 is 99 -> validation must fail immediately.
             Replay { start: 1, end: 100 },
+            ExpectFatalError {
+                timeout: stall_timeout(),
+            },
+            Disconnect,
+        ],
+    )
+}
+
+/// Replay fails fast when the requested start sequence is older than the
+/// stream head (messages have been purged and replaced with newer ones).
+#[test]
+fn test_nats_replay_start_before_first_sequence_fails_fast() -> AnyResult<()> {
+    use NatsMockAction::*;
+    run_nats_mock_test(
+        nats_stall_config,
+        &[
+            StartNats,
+            CreateStream,
+            Publish(5),
+            // Consume once to establish realistic sequence progression.
+            CreatePipeline,
+            Extend,
+            WaitForRecords(5),
+            Disconnect,
+            // Remove old messages and publish new ones at higher sequences.
+            PurgeStream,
+            Publish(3),
+            // Replay old sequence range should fail fast.
+            CreatePipeline,
+            Replay { start: 1, end: 2 },
+            ExpectFatalError {
+                timeout: stall_timeout(),
+            },
+            Disconnect,
+        ],
+    )
+}
+
+/// Replay fails fast when requesting a non-empty range from an empty stream.
+#[test]
+fn test_nats_replay_empty_stream_fails_fast() -> AnyResult<()> {
+    use NatsMockAction::*;
+    run_nats_mock_test(
+        nats_stall_config,
+        &[
+            StartNats,
+            CreateStream,
+            CreatePipeline,
+            Replay { start: 1, end: 2 },
             ExpectFatalError {
                 timeout: stall_timeout(),
             },

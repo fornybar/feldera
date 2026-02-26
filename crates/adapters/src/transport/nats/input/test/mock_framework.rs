@@ -10,7 +10,7 @@ use serde_json::json;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Atomic actions for declarative mock_input_pipeline tests.
 ///
@@ -39,6 +39,9 @@ pub(super) enum NatsMockAction {
     /// Queue repeatedly until `n` total records have been flushed to the zset.
     /// Aborts early with an error if a fatal endpoint error is detected.
     WaitForRecords(usize),
+    /// Like `WaitForRecords`, but tolerates non-fatal endpoint errors as long
+    /// as a fatal error never occurs.
+    WaitForRecordsNoFatal(usize),
     /// Issue a replay for the half-open JetStream sequence range `[start, end)`.
     ///
     /// JetStream sequences are **1-based** (first message = sequence 1), and
@@ -47,12 +50,16 @@ pub(super) enum NatsMockAction {
     Replay { start: u64, end: u64 },
     /// Call `endpoint.disconnect()`.
     Disconnect,
+    /// Disconnect without asserting absence of non-fatal endpoint errors.
+    DisconnectAllowNonFatal,
 
     /// Sleep for the given duration.
     Sleep(Duration),
 
     /// Drop the NATS process guard (kills the server).
     KillServer,
+    /// Restart NATS on the same TCP port used previously.
+    RestartNatsSamePort,
     /// Delete the stream via the JetStream API.
     DeleteStream,
 
@@ -66,6 +73,8 @@ pub(super) enum NatsMockAction {
     /// Assert that a fatal error appears within `timeout`. Also polls
     /// `endpoint.queue(false)` each iteration (matching original tests).
     ExpectFatalError { timeout: Duration },
+    /// Assert that a fatal error appears within [min, max] time window.
+    ExpectFatalErrorWithin { min: Duration, max: Duration },
 
     /// Verify that `count` output records starting at `output_index` match
     /// the corresponding published records. The NATS sequence is derived
@@ -236,6 +245,38 @@ impl NatsMockRunner {
                 );
             }
 
+            NatsMockAction::WaitForRecordsNoFatal(n) => {
+                let n = *n;
+                let endpoint = self.endpoint();
+                let zset = self.zset();
+                wait(
+                    || {
+                        endpoint.queue(false);
+                        if self.got_fatal.load(Ordering::Acquire) {
+                            return true;
+                        }
+                        zset.state().flushed.len() >= n
+                    },
+                    DEFAULT_TIMEOUT_MS,
+                )
+                .map_err(|()| {
+                    anyhow::anyhow!(
+                        "Timed out waiting for {n} records without fatal error (got {})",
+                        zset.state().flushed.len()
+                    )
+                })?;
+                assert!(
+                    !self.got_fatal.load(Ordering::Acquire),
+                    "Unexpected fatal endpoint error while waiting for records: {:?}",
+                    self.mock_input_consumer().state().endpoint_error
+                );
+                assert!(
+                    zset.state().flushed.len() >= n,
+                    "Expected at least {n} records, got {}",
+                    zset.state().flushed.len()
+                );
+            }
+
             NatsMockAction::Replay { start, end } => {
                 let metadata = json!({
                     "sequence_numbers": {
@@ -262,6 +303,14 @@ impl NatsMockRunner {
                 self.endpoint().disconnect();
             }
 
+            NatsMockAction::DisconnectAllowNonFatal => {
+                assert!(
+                    !self.mock_input_consumer().state().eoi,
+                    "Streaming NATS connector should never signal end-of-input"
+                );
+                self.endpoint().disconnect();
+            }
+
             NatsMockAction::Sleep(dur) => {
                 sleep(*dur);
             }
@@ -270,6 +319,19 @@ impl NatsMockRunner {
                 self.nats_guard
                     .take()
                     .expect("KillServer: no NATS server to kill");
+            }
+
+            NatsMockAction::RestartNatsSamePort => {
+                let current_url = self.nats_url().to_string();
+                let port = current_url
+                    .rsplit_once(':')
+                    .ok_or_else(|| anyhow::anyhow!("Invalid NATS URL: {current_url}"))?
+                    .1
+                    .parse::<u16>()
+                    .map_err(|e| anyhow::anyhow!("Invalid NATS URL port in {current_url}: {e}"))?;
+                let (guard, url) = util::start_nats_on_port(port)?;
+                self.nats_guard = Some(guard);
+                self.nats_url = Some(url);
             }
 
             NatsMockAction::DeleteStream => {
@@ -328,6 +390,32 @@ impl NatsMockRunner {
                     self.got_fatal.load(Ordering::Acquire),
                     "Error should be fatal"
                 );
+            }
+
+            NatsMockAction::ExpectFatalErrorWithin { min, max } => {
+                let min_ms = min.as_millis();
+                let max_ms = max.as_millis();
+                let endpoint = self.endpoint();
+                let mock_input_consumer = self.mock_input_consumer();
+                let start = Instant::now();
+                wait(
+                    || {
+                        endpoint.queue(false);
+                        mock_input_consumer.state().endpoint_error.is_some()
+                    },
+                    max_ms,
+                )
+                .map_err(|()| anyhow::anyhow!("Timed out after {max_ms}ms waiting for fatal error"))?;
+                let elapsed_ms = start.elapsed().as_millis();
+                assert!(
+                    elapsed_ms >= min_ms,
+                    "Fatal error arrived too early: {elapsed_ms}ms < {min_ms}ms"
+                );
+                assert!(
+                    elapsed_ms <= max_ms,
+                    "Fatal error arrived too late: {elapsed_ms}ms > {max_ms}ms"
+                );
+                assert!(self.got_fatal.load(Ordering::Acquire), "Error should be fatal");
             }
 
             NatsMockAction::VerifyRecords {
@@ -435,6 +523,14 @@ const STALL_INACTIVITY_TIMEOUT_SECS: u64 = 2;
 
 /// Config helper: NATS config with inactivity timeout and request_timeout_secs=2.
 pub(super) fn nats_stall_config(nats_url: &str) -> String {
+    nats_stall_config_with_timeout(nats_url, STALL_INACTIVITY_TIMEOUT_SECS, 2)
+}
+
+pub(super) fn nats_stall_config_with_timeout(
+    nats_url: &str,
+    inactivity_timeout_secs: u64,
+    request_timeout_secs: u64,
+) -> String {
     format!(
         r#"
 stream: test_input
@@ -443,9 +539,9 @@ transport:
     config:
         connection_config:
             server_url: {nats_url}
-            request_timeout_secs: 2
+            request_timeout_secs: {request_timeout_secs}
         stream_name: {STREAM_NAME}
-        inactivity_timeout_secs: {STALL_INACTIVITY_TIMEOUT_SECS}
+        inactivity_timeout_secs: {inactivity_timeout_secs}
         consumer_config:
             deliver_policy: All
             subjects: [{SUBJECT_NAME}]
