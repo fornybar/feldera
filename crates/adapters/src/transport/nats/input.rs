@@ -264,6 +264,13 @@ impl NatsReader {
         let nats_consumer_config = translate_consumer_options(&config.consumer_config);
         let inactivity_timeout = Duration::from_secs(config.inactivity_timeout_secs);
 
+        validate_resume_position(
+            &jetstream,
+            &config.stream_name,
+            next_sequence.load(Ordering::Acquire),
+        )
+        .await?;
+
         let mut command_receiver = InputCommandReceiver::<Metadata, ()>::new(command_receiver);
 
         // Handle replay commands
@@ -617,6 +624,50 @@ async fn validate_replay_range(
     if requested_last > available_last {
         return Err(anyhow!(
             "Replay end sequence {requested_last} exceeds available stream tail {available_last} for stream '{stream_name}'"
+        ));
+    }
+
+    Ok(())
+}
+
+async fn validate_resume_position(
+    jetstream: &jetstream::Context,
+    stream_name: &str,
+    next_sequence: u64,
+) -> AnyResult<()> {
+    // Fresh starts use `0` and should always be allowed.
+    if next_sequence == 0 {
+        return Ok(());
+    }
+
+    let mut stream = jetstream
+        .get_stream(stream_name)
+        .await
+        .with_context(|| format!("Failed to get stream '{stream_name}'"))?;
+    let stream_info = stream
+        .info()
+        .await
+        .with_context(|| format!("Failed to fetch stream info for '{stream_name}'"))?;
+
+    if stream_info.state.messages == 0 {
+        return Err(anyhow!(
+            "Resume sequence {next_sequence} is invalid for stream '{stream_name}': stream is empty"
+        ));
+    }
+
+    let available_first = stream_info.state.first_sequence;
+    let available_last = stream_info.state.last_sequence;
+    let valid_upper = available_last.saturating_add(1);
+
+    if next_sequence < available_first {
+        return Err(anyhow!(
+            "Resume sequence {next_sequence} is before earliest available sequence {available_first} for stream '{stream_name}'"
+        ));
+    }
+
+    if next_sequence > valid_upper {
+        return Err(anyhow!(
+            "Resume sequence {next_sequence} is after valid upper bound {valid_upper} for stream '{stream_name}'"
         ));
     }
 
