@@ -148,11 +148,6 @@ struct NatsReader {
     command_sender: UnboundedSender<InputReaderCommand>,
 }
 
-enum HealthCheckFailure {
-    ServerUnavailable(AnyError),
-    StreamUnavailable(AnyError),
-}
-
 impl NatsReader {
     fn new(
         config: Arc<NatsInputConfig>,
@@ -260,14 +255,14 @@ impl NatsReader {
     async fn verify_server_and_stream_health(
         connection_config: &cfg::ConnectOptions,
         stream_name: &str,
-    ) -> Result<(), HealthCheckFailure> {
+    ) -> Result<(), AnyError> {
         let client = Self::connect_nats(connection_config)
             .await
-            .map_err(HealthCheckFailure::ServerUnavailable)?;
+            .context("server health check failed")?;
         let js = jetstream::new(client);
         Self::verify_stream_exists(&js, stream_name)
             .await
-            .map_err(HealthCheckFailure::StreamUnavailable)
+            .with_context(|| format!("stream '{stream_name}' health check failed"))
     }
 
     async fn worker_task(
@@ -471,17 +466,10 @@ async fn consume_nats_messages_until(
                     .await
                 {
                     Ok(()) => continue,
-                    Err(HealthCheckFailure::ServerUnavailable(error)) => {
+                    Err(error) => {
                         return Err(anyhow!(
-                            "NATS replay stalled for {:?} and server health check failed: {error:#}",
-                            inactivity_timeout
-                        ));
-                    }
-                    Err(HealthCheckFailure::StreamUnavailable(error)) => {
-                        return Err(anyhow!(
-                            "NATS replay stalled for {:?} and stream '{}' health check failed: {error:#}",
+                            "NATS replay stalled for {:?} and {error:#}",
                             inactivity_timeout,
-                            stream_name
                         ));
                     }
                 }
@@ -593,24 +581,12 @@ async fn spawn_nats_reader(
                             Err(_) => {
                                 match NatsReader::verify_server_and_stream_health(&connection_config, &stream_name).await {
                                     Ok(()) => (),
-                                    Err(HealthCheckFailure::ServerUnavailable(error)) => {
+                                    Err(error) => {
                                         consumer.error(
                                             true,
                                             anyhow!(
-                                                "NATS input stalled for {:?} and server health check failed: {error:#}",
-                                                inactivity_timeout
-                                            ),
-                                            Some("nats-input"),
-                                        );
-                                        return;
-                                    }
-                                    Err(HealthCheckFailure::StreamUnavailable(error)) => {
-                                        consumer.error(
-                                            true,
-                                            anyhow!(
-                                                "NATS input stalled for {:?} and stream '{}' health check failed: {error:#}",
+                                                "NATS input stalled for {:?} and {error:#}",
                                                 inactivity_timeout,
-                                                stream_name
                                             ),
                                             Some("nats-input"),
                                         );
