@@ -405,7 +405,9 @@ impl NatsMockRunner {
                     },
                     max_ms,
                 )
-                .map_err(|()| anyhow::anyhow!("Timed out after {max_ms}ms waiting for fatal error"))?;
+                .map_err(|()| {
+                    anyhow::anyhow!("Timed out after {max_ms}ms waiting for fatal error")
+                })?;
                 let elapsed_ms = start.elapsed().as_millis();
                 assert!(
                     elapsed_ms >= min_ms,
@@ -415,7 +417,10 @@ impl NatsMockRunner {
                     elapsed_ms <= max_ms,
                     "Fatal error arrived too late: {elapsed_ms}ms > {max_ms}ms"
                 );
-                assert!(self.got_fatal.load(Ordering::Acquire), "Error should be fatal");
+                assert!(
+                    self.got_fatal.load(Ordering::Acquire),
+                    "Error should be fatal"
+                );
             }
 
             NatsMockAction::VerifyRecords {

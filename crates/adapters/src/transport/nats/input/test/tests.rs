@@ -79,7 +79,7 @@ fn test_nats_stream_deleted_mid_run_stalls() -> AnyResult<()> {
 
 /// Tests that the connector reports a fatal error if replay stalls and the
 /// stream is deleted before the replay can complete. We simulate a running replay loop
-/// by not having any messages in stream. 
+/// by not having any messages in stream.
 #[test]
 fn test_nats_replay_stream_deleted_stalls() -> AnyResult<()> {
     use NatsMockAction::*;
@@ -102,7 +102,7 @@ fn test_nats_replay_stream_deleted_stalls() -> AnyResult<()> {
 
 /// Tests that the connector reports a fatal error if replay stalls and the
 /// NATS server dies before the replay can complete. We simulate a running replay loop
-/// by not having any messages in stream. 
+/// by not having any messages in stream.
 #[test]
 fn test_nats_replay_server_killed_stalls() -> AnyResult<()> {
     use NatsMockAction::*;
@@ -384,8 +384,9 @@ fn test_nats_replay_end_after_last_sequence_fails_fast() -> AnyResult<()> {
             CreatePipeline,
             // Tail is 5, but end-1 is 99 -> validation must fail immediately.
             Replay { start: 1, end: 100 },
-            ExpectFatalError {
-                timeout: stall_timeout(),
+            ExpectFatalErrorWithin {
+                min: Duration::from_millis(0),
+                max: Duration::from_secs(2),
             },
             Disconnect,
         ],
@@ -414,8 +415,9 @@ fn test_nats_replay_start_before_first_sequence_fails_fast() -> AnyResult<()> {
             // Replay old sequence range should fail fast.
             CreatePipeline,
             Replay { start: 1, end: 2 },
-            ExpectFatalError {
-                timeout: stall_timeout(),
+            ExpectFatalErrorWithin {
+                min: Duration::from_millis(0),
+                max: Duration::from_secs(2),
             },
             Disconnect,
         ],
@@ -433,8 +435,9 @@ fn test_nats_replay_empty_stream_fails_fast() -> AnyResult<()> {
             CreateStream,
             CreatePipeline,
             Replay { start: 1, end: 2 },
-            ExpectFatalError {
-                timeout: stall_timeout(),
+            ExpectFatalErrorWithin {
+                min: Duration::from_millis(0),
+                max: Duration::from_secs(2),
             },
             Disconnect,
         ],
@@ -988,4 +991,41 @@ format:
     );
 
     assert_nats_connect_error(result, non_routable_url, "timed out");
+}
+
+/// Test that inactivity_timeout_secs=0 is rejected early by configuration validation.
+#[test]
+fn test_nats_inactivity_timeout_zero_rejected() {
+    let config_str = r#"
+stream: test_input
+transport:
+    name: nats_input
+    config:
+        connection_config:
+            server_url: nats://127.0.0.1:4222
+        stream_name: some_stream
+        inactivity_timeout_secs: 0
+        consumer_config:
+            deliver_policy: All
+format:
+    name: json
+    config:
+        update_format: raw
+"#;
+
+    let result = mock_input_pipeline::<NatsTestRecord, NatsTestRecord>(
+        serde_yaml::from_str(config_str).unwrap(),
+        Relation::empty(),
+    );
+
+    match result {
+        Ok(_) => panic!("Expected inactivity_timeout_secs=0 to be rejected"),
+        Err(err) => {
+            let err_msg = format!("{err:#}");
+            assert!(
+                err_msg.contains("inactivity_timeout_secs"),
+                "Error message should mention inactivity_timeout_secs, got: {err_msg}"
+            );
+        }
+    }
 }

@@ -125,7 +125,7 @@ pub struct NatsInputConfig {
     pub connection_config: ConnectOptions,
     pub stream_name: String,
     /// Maximum time in seconds to wait for the next message before running
-    /// a stream/server health check.
+    /// a stream/server health check. Must be at least 1.
     #[serde(default = "default_inactivity_timeout_secs")]
     pub inactivity_timeout_secs: u64,
     pub consumer_config: ConsumerConfig,

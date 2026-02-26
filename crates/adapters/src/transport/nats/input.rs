@@ -106,6 +106,11 @@ pub struct NatsInputEndpoint {
 
 impl NatsInputEndpoint {
     pub fn new(config: NatsInputConfig) -> Result<Self, AnyError> {
+        if config.inactivity_timeout_secs == 0 {
+            return Err(anyhow!(
+                "Invalid NATS input configuration: inactivity_timeout_secs must be at least 1 second"
+            ));
+        }
         Ok(Self {
             config: Arc::new(config),
         })
@@ -141,6 +146,11 @@ impl TransportInputEndpoint for NatsInputEndpoint {
 
 struct NatsReader {
     command_sender: UnboundedSender<InputReaderCommand>,
+}
+
+enum HealthCheckFailure {
+    ServerUnavailable(AnyError),
+    StreamUnavailable(AnyError),
 }
 
 impl NatsReader {
@@ -243,11 +253,21 @@ impl NatsReader {
         jetstream: &jetstream::Context,
         stream_name: &str,
     ) -> Result<(), AnyError> {
-        jetstream
-            .get_stream(stream_name)
-            .await
-            .with_context(|| format!("Failed to get stream '{stream_name}'"))?;
+        let _ = fetch_stream_state(jetstream, stream_name).await?;
         Ok(())
+    }
+
+    async fn verify_server_and_stream_health(
+        connection_config: &cfg::ConnectOptions,
+        stream_name: &str,
+    ) -> Result<(), HealthCheckFailure> {
+        let client = Self::connect_nats(connection_config)
+            .await
+            .map_err(HealthCheckFailure::ServerUnavailable)?;
+        let js = jetstream::new(client);
+        Self::verify_stream_exists(&js, stream_name)
+            .await
+            .map_err(HealthCheckFailure::StreamUnavailable)
     }
 
     async fn worker_task(
@@ -295,7 +315,7 @@ impl NatsReader {
                 let (hasher, buffer_size) = consume_nats_messages_until(
                     nats_consumer,
                     last_message_sequence,
-                    &jetstream,
+                    &config.connection_config,
                     &config.stream_name,
                     inactivity_timeout,
                     consumer.clone(),
@@ -370,7 +390,7 @@ impl NatsReader {
                                 nats_consumer,
                                 next_sequence.clone(),
                                 queue.clone(),
-                                jetstream.clone(),
+                                config.connection_config.clone(),
                                 config.stream_name.clone(),
                                 inactivity_timeout,
                                 consumer.clone(),
@@ -432,7 +452,7 @@ async fn create_nats_consumer(
 async fn consume_nats_messages_until(
     nats_consumer: NatsConsumer,
     last_message_sequence: u64,
-    jetstream: &jetstream::Context,
+    connection_config: &cfg::ConnectOptions,
     stream_name: &str,
     inactivity_timeout: Duration,
     consumer: Box<dyn InputConsumer>,
@@ -447,13 +467,24 @@ async fn consume_nats_messages_until(
         let Some(result) = (match next_result {
             Ok(result) => result,
             Err(_) => {
-                if let Err(error) = NatsReader::verify_stream_exists(jetstream, stream_name).await {
-                    return Err(anyhow!(
-                        "NATS replay stalled for {:?} and stream health check failed: {error:#}",
-                        inactivity_timeout
-                    ));
+                match NatsReader::verify_server_and_stream_health(connection_config, stream_name)
+                    .await
+                {
+                    Ok(()) => continue,
+                    Err(HealthCheckFailure::ServerUnavailable(error)) => {
+                        return Err(anyhow!(
+                            "NATS replay stalled for {:?} and server health check failed: {error:#}",
+                            inactivity_timeout
+                        ));
+                    }
+                    Err(HealthCheckFailure::StreamUnavailable(error)) => {
+                        return Err(anyhow!(
+                            "NATS replay stalled for {:?} and stream '{}' health check failed: {error:#}",
+                            inactivity_timeout,
+                            stream_name
+                        ));
+                    }
                 }
-                continue;
             }
         }) else {
             return Err(anyhow!("Unexpected end of NATS stream"));
@@ -514,7 +545,7 @@ async fn spawn_nats_reader(
     nats_consumer: NatsConsumer,
     next_sequence: Arc<AtomicU64>,
     queue: Arc<InputQueue<u64>>,
-    jetstream: jetstream::Context,
+    connection_config: cfg::ConnectOptions,
     stream_name: String,
     inactivity_timeout: Duration,
     consumer: Box<dyn InputConsumer>,
@@ -560,16 +591,31 @@ async fn spawn_nats_reader(
                                 }
                             }
                             Err(_) => {
-                                if let Err(error) = NatsReader::verify_stream_exists(&jetstream, &stream_name).await {
-                                    consumer.error(
-                                        true,
-                                        anyhow!(
-                                            "NATS input stalled for {:?} and stream health check failed: {error:#}",
-                                            inactivity_timeout
-                                        ),
-                                        Some("nats-input"),
-                                    );
-                                    return;
+                                match NatsReader::verify_server_and_stream_health(&connection_config, &stream_name).await {
+                                    Ok(()) => (),
+                                    Err(HealthCheckFailure::ServerUnavailable(error)) => {
+                                        consumer.error(
+                                            true,
+                                            anyhow!(
+                                                "NATS input stalled for {:?} and server health check failed: {error:#}",
+                                                inactivity_timeout
+                                            ),
+                                            Some("nats-input"),
+                                        );
+                                        return;
+                                    }
+                                    Err(HealthCheckFailure::StreamUnavailable(error)) => {
+                                        consumer.error(
+                                            true,
+                                            anyhow!(
+                                                "NATS input stalled for {:?} and stream '{}' health check failed: {error:#}",
+                                                inactivity_timeout,
+                                                stream_name
+                                            ),
+                                            Some("nats-input"),
+                                        );
+                                        return;
+                                    }
                                 }
                             }
                         }
@@ -585,15 +631,16 @@ async fn spawn_nats_reader(
     })
 }
 
-async fn validate_replay_range(
+struct StreamState {
+    messages: u64,
+    first_sequence: u64,
+    last_sequence: u64,
+}
+
+async fn fetch_stream_state(
     jetstream: &jetstream::Context,
     stream_name: &str,
-    requested_range: &std::ops::Range<u64>,
-) -> AnyResult<()> {
-    if requested_range.is_empty() {
-        return Ok(());
-    }
-
+) -> AnyResult<StreamState> {
     let mut stream = jetstream
         .get_stream(stream_name)
         .await
@@ -603,7 +650,25 @@ async fn validate_replay_range(
         .await
         .with_context(|| format!("Failed to fetch stream info for '{stream_name}'"))?;
 
-    if stream_info.state.messages == 0 {
+    Ok(StreamState {
+        messages: stream_info.state.messages,
+        first_sequence: stream_info.state.first_sequence,
+        last_sequence: stream_info.state.last_sequence,
+    })
+}
+
+async fn validate_replay_range(
+    jetstream: &jetstream::Context,
+    stream_name: &str,
+    requested_range: &std::ops::Range<u64>,
+) -> AnyResult<()> {
+    if requested_range.is_empty() {
+        return Ok(());
+    }
+
+    let stream_state = fetch_stream_state(jetstream, stream_name).await?;
+
+    if stream_state.messages == 0 {
         return Err(anyhow!(
             "Replay requested sequences {:?} from stream '{stream_name}', but the stream is empty",
             requested_range
@@ -612,8 +677,8 @@ async fn validate_replay_range(
 
     let requested_first = requested_range.start;
     let requested_last = requested_range.end - 1;
-    let available_first = stream_info.state.first_sequence;
-    let available_last = stream_info.state.last_sequence;
+    let available_first = stream_state.first_sequence;
+    let available_last = stream_state.last_sequence;
 
     if requested_first < available_first || requested_first > available_last {
         return Err(anyhow!(
@@ -640,23 +705,16 @@ async fn validate_resume_position(
         return Ok(());
     }
 
-    let mut stream = jetstream
-        .get_stream(stream_name)
-        .await
-        .with_context(|| format!("Failed to get stream '{stream_name}'"))?;
-    let stream_info = stream
-        .info()
-        .await
-        .with_context(|| format!("Failed to fetch stream info for '{stream_name}'"))?;
+    let stream_state = fetch_stream_state(jetstream, stream_name).await?;
 
-    if stream_info.state.messages == 0 {
+    if stream_state.messages == 0 {
         return Err(anyhow!(
             "Resume sequence {next_sequence} is invalid for stream '{stream_name}': stream is empty"
         ));
     }
 
-    let available_first = stream_info.state.first_sequence;
-    let available_last = stream_info.state.last_sequence;
+    let available_first = stream_state.first_sequence;
+    let available_last = stream_state.last_sequence;
     let valid_upper = available_last.saturating_add(1);
 
     if next_sequence < available_first {

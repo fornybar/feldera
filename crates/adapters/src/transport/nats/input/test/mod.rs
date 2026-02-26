@@ -62,6 +62,24 @@ mod util {
     }
 
     pub fn start_nats_and_get_address() -> AnyResult<(ProcessKillGuard, String)> {
+        const MAX_ATTEMPTS: usize = 2;
+        let mut last_error: Option<anyhow::Error> = None;
+        for attempt in 1..=MAX_ATTEMPTS {
+            match start_nats_and_get_address_once() {
+                Ok(result) => return Ok(result),
+                Err(error) => {
+                    last_error = Some(error);
+                    if attempt < MAX_ATTEMPTS {
+                        std::thread::sleep(Duration::from_millis(250));
+                    }
+                }
+            }
+        }
+
+        Err(last_error.expect("at least one attempt should have failed"))
+    }
+
+    fn start_nats_and_get_address_once() -> AnyResult<(ProcessKillGuard, String)> {
         let nats_ip_addr = "127.0.0.1";
         const RANDOM_PORT: &str = "-1";
 
@@ -126,7 +144,10 @@ mod util {
             .stderr(Stdio::null())
             .spawn()?;
 
-        Ok((ProcessKillGuard::new(child), format!("nats://{nats_ip_addr}:{port}")))
+        Ok((
+            ProcessKillGuard::new(child),
+            format!("nats://{nats_ip_addr}:{port}"),
+        ))
     }
 
     pub async fn create_stream(nats_url: &str, stream: &str, subject: &str) -> AnyResult<()> {
