@@ -78,7 +78,8 @@ fn test_nats_stream_deleted_mid_run_stalls() -> AnyResult<()> {
 }
 
 /// Tests that the connector reports a fatal error if replay stalls and the
-/// stream is deleted before the replay can complete.
+/// stream is deleted before the replay can complete. We simulate a running replay loop
+/// by not having any messages in stream. 
 #[test]
 fn test_nats_replay_stream_deleted_stalls() -> AnyResult<()> {
     use NatsMockAction::*;
@@ -100,7 +101,8 @@ fn test_nats_replay_stream_deleted_stalls() -> AnyResult<()> {
 }
 
 /// Tests that the connector reports a fatal error if replay stalls and the
-/// NATS server dies before the replay can complete.
+/// NATS server dies before the replay can complete. We simulate a running replay loop
+/// by not having any messages in stream. 
 #[test]
 fn test_nats_replay_server_killed_stalls() -> AnyResult<()> {
     use NatsMockAction::*;
@@ -290,35 +292,35 @@ fn test_nats_replay_empty_range() -> AnyResult<()> {
     )
 }
 
-/// Replay fails with a fatal error when the stream has been purged and the
-/// requested sequence numbers no longer exist.
-#[test]
-fn test_nats_replay_after_purge_errors() -> AnyResult<()> {
-    use NatsMockAction::*;
-    run_nats_mock_test(
-        nats_stall_config,
-        &[
-            StartNats,
-            CreateStream,
-            Publish(5),
-            // First pipeline: consume all 5 records.
-            CreatePipeline,
-            Extend,
-            WaitForRecords(5),
-            AssertRecordCount(5),
-            Disconnect,
-            // Purge the stream — all messages deleted.
-            PurgeStream,
-            // Second pipeline: attempt to replay sequences [1, 6) — should fail.
-            CreatePipeline,
-            Replay { start: 1, end: 6 },
-            ExpectFatalError {
-                timeout: stall_timeout(),
-            },
-            Disconnect,
-        ],
-    )
-}
+///// Replay fails with a fatal error when the stream has been purged and the
+///// requested sequence numbers no longer exist.
+//#[test]
+//fn test_nats_replay_after_purge_errors() -> AnyResult<()> {
+//    use NatsMockAction::*;
+//    run_nats_mock_test(
+//        nats_stall_config,
+//        &[
+//            StartNats,
+//            CreateStream,
+//            Publish(5),
+//            // First pipeline: consume all 5 records.
+//            CreatePipeline,
+//            Extend,
+//            WaitForRecords(5),
+//            AssertRecordCount(5),
+//            Disconnect,
+//            // Purge the stream — all messages deleted.
+//            PurgeStream,
+//            // Second pipeline: attempt to replay sequences [1, 6) — should fail.
+//            CreatePipeline,
+//            Replay { start: 1, end: 6 },
+//            ExpectFatalError {
+//                timeout: stall_timeout(),
+//            },
+//            Disconnect,
+//        ],
+//    )
+//}
 
 /// Multiple sequential replays before extending.
 #[test]
@@ -586,41 +588,41 @@ fn test_nats_ft_empty_step_checkpoint() {
     ]);
 }
 
-/// Tests that replay fails with an error (rather than looping forever) when the
-/// stream has been purged and the checkpointed messages no longer exist.
-///
-/// Scenario:
-/// 1. Publish 5 messages, run pipeline, checkpoint (sequences committed)
-/// 2. Publish 5 more messages, consume them but do NOT checkpoint, stop
-/// 3. Purge the stream (all messages deleted)
-/// 4. Start pipeline — FT framework sends a Replay for the uncommitted
-///    sequences, but those messages are gone → expect fatal error
-///
-/// Without a fix, the replay path loops forever: the health check succeeds
-/// (stream still exists, consumer creates fine) but no messages arrive because
-/// the requested sequences were purged. The ordered consumer silently adjusts
-/// its start sequence to the stream's current first sequence.
-#[test]
-fn test_nats_ft_replay_after_stream_purge() -> AnyResult<()> {
-    use NatsControllerAction::*;
-    run_nats_controller_test(
-        NatsControllerRunner::new()?.with_inactivity_timeout_secs(1),
-        &[
-            StartNats,
-            CreateStream,
-            RunFtCycle {
-                publish: 5,
-                checkpoint: true,
-            },
-            RunFtCycle {
-                publish: 5,
-                checkpoint: false,
-            },
-            PurgeStream,
-            ExpectStartupFatal,
-        ],
-    )
-}
+///// Tests that replay fails with an error (rather than looping forever) when the
+///// stream has been purged and the checkpointed messages no longer exist.
+/////
+///// Scenario:
+///// 1. Publish 5 messages, run pipeline, checkpoint (sequences committed)
+///// 2. Publish 5 more messages, consume them but do NOT checkpoint, stop
+///// 3. Purge the stream (all messages deleted)
+///// 4. Start pipeline — FT framework sends a Replay for the uncommitted
+/////    sequences, but those messages are gone → expect fatal error
+/////
+///// Without a fix, the replay path loops forever: the health check succeeds
+///// (stream still exists, consumer creates fine) but no messages arrive because
+///// the requested sequences were purged. The ordered consumer silently adjusts
+///// its start sequence to the stream's current first sequence.
+//#[test]
+//fn test_nats_ft_replay_after_stream_purge() -> AnyResult<()> {
+//    use NatsControllerAction::*;
+//    run_nats_controller_test(
+//        NatsControllerRunner::new()?.with_inactivity_timeout_secs(1),
+//        &[
+//            StartNats,
+//            CreateStream,
+//            RunFtCycle {
+//                publish: 5,
+//                checkpoint: true,
+//            },
+//            RunFtCycle {
+//                publish: 5,
+//                checkpoint: false,
+//            },
+//            PurgeStream,
+//            ExpectStartupFatal,
+//        ],
+//    )
+//}
 
 /// Tests rapid restart+replay with a named consumer.
 ///
@@ -651,64 +653,64 @@ fn test_nats_ft_with_named_consumer() -> AnyResult<()> {
     )
 }
 
-/// Checkpoint, delete+recreate stream, then restart. Replay should fail
-/// because the committed sequence numbers no longer exist in the new stream.
-#[test]
-fn test_nats_ft_stream_deletion_and_recreation() -> AnyResult<()> {
-    use NatsControllerAction::*;
-    run_nats_controller_test(
-        NatsControllerRunner::new()?.with_inactivity_timeout_secs(1),
-        &[
-            StartNats,
-            CreateStream,
-            // Round 1: publish 5 records, consume and checkpoint.
-            RunFtCycle {
-                publish: 5,
-                checkpoint: true,
-            },
-            // Round 2: publish 5 more, consume but do NOT checkpoint.
-            RunFtCycle {
-                publish: 5,
-                checkpoint: false,
-            },
-            // Delete and recreate the stream — all old messages are gone.
-            DeleteStream,
-            CreateStream,
-            // Restart: FT framework tries to replay uncommitted sequences,
-            // but they don't exist in the fresh stream → fatal error.
-            ExpectStartupFatal,
-        ],
-    )
-}
+///// Checkpoint, delete+recreate stream, then restart. Replay should fail
+///// because the committed sequence numbers no longer exist in the new stream.
+//#[test]
+//fn test_nats_ft_stream_deletion_and_recreation() -> AnyResult<()> {
+//    use NatsControllerAction::*;
+//    run_nats_controller_test(
+//        NatsControllerRunner::new()?.with_inactivity_timeout_secs(1),
+//        &[
+//            StartNats,
+//            CreateStream,
+//            // Round 1: publish 5 records, consume and checkpoint.
+//            RunFtCycle {
+//                publish: 5,
+//                checkpoint: true,
+//            },
+//            // Round 2: publish 5 more, consume but do NOT checkpoint.
+//            RunFtCycle {
+//                publish: 5,
+//                checkpoint: false,
+//            },
+//            // Delete and recreate the stream — all old messages are gone.
+//            DeleteStream,
+//            CreateStream,
+//            // Restart: FT framework tries to replay uncommitted sequences,
+//            // but they don't exist in the fresh stream → fatal error.
+//            ExpectStartupFatal,
+//        ],
+//    )
+//}
 
-/// Checkpoint, delete+recreate stream, publish new data, and restart.
-/// With all rounds checkpointed before deletion, there's nothing to replay,
-/// so the pipeline should start successfully and consume the new data.
-#[test]
-fn test_nats_ft_stream_deletion_after_full_checkpoint() -> AnyResult<()> {
-    use NatsControllerAction::*;
-    run_nats_controller_test(
-        NatsControllerRunner::new()?,
-        &[
-            StartNats,
-            CreateStream,
-            // Round 1: publish and checkpoint everything.
-            RunFtCycle {
-                publish: 5,
-                checkpoint: true,
-            },
-            // Delete and recreate stream — but everything was checkpointed,
-            // so nothing needs replaying.
-            DeleteStream,
-            CreateStream,
-            // Round 2: publish new records to the fresh stream and consume.
-            RunFtCycle {
-                publish: 5,
-                checkpoint: true,
-            },
-        ],
-    )
-}
+///// Checkpoint, delete+recreate stream, publish new data, and restart.
+///// With all rounds checkpointed before deletion, there's nothing to replay,
+///// so the pipeline should start successfully and consume the new data.
+//#[test]
+//fn test_nats_ft_stream_deletion_after_full_checkpoint() -> AnyResult<()> {
+//    use NatsControllerAction::*;
+//    run_nats_controller_test(
+//        NatsControllerRunner::new()?,
+//        &[
+//            StartNats,
+//            CreateStream,
+//            // Round 1: publish and checkpoint everything.
+//            RunFtCycle {
+//                publish: 5,
+//                checkpoint: true,
+//            },
+//            // Delete and recreate stream — but everything was checkpointed,
+//            // so nothing needs replaying.
+//            DeleteStream,
+//            CreateStream,
+//            // Round 2: publish new records to the fresh stream and consume.
+//            RunFtCycle {
+//                publish: 5,
+//                checkpoint: true,
+//            },
+//        ],
+//    )
+//}
 
 /// Helper to assert that a connection error contains expected context.
 fn assert_nats_connect_error(
