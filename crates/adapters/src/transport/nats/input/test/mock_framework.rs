@@ -4,7 +4,7 @@ use crate::test::{
     DEFAULT_TIMEOUT_MS, MockDeZSet, MockInputConsumer, init_test_logger, mock_input_pipeline, wait,
 };
 use crate::transport::InputReader;
-use anyhow::Result as AnyResult;
+use anyhow::{Error as AnyError, Result as AnyResult};
 use feldera_types::program_schema::Relation;
 use serde_json::json;
 use std::sync::Arc;
@@ -114,6 +114,7 @@ struct NatsMockRunner {
     endpoint: Option<Box<dyn InputReader>>,
     mock_input_consumer: Option<MockInputConsumer>,
     zset: Option<MockDeZSet<NatsTestRecord, NatsTestRecord>>,
+    pipeline_create_error: Option<AnyError>,
     got_fatal: Arc<AtomicBool>,
     error_count: Arc<AtomicUsize>,
     rt: tokio::runtime::Runtime,
@@ -133,6 +134,7 @@ impl NatsMockRunner {
             endpoint: None,
             mock_input_consumer: None,
             zset: None,
+            pipeline_create_error: None,
             got_fatal: Arc::new(AtomicBool::new(false)),
             error_count: Arc::new(AtomicUsize::new(0)),
             rt: tokio::runtime::Runtime::new()?,
@@ -146,21 +148,33 @@ impl NatsMockRunner {
     }
 
     fn endpoint(&self) -> &dyn InputReader {
-        self.endpoint
-            .as_deref()
-            .expect("CreatePipeline must be called before this action")
+        if let Some(endpoint) = self.endpoint.as_deref() {
+            endpoint
+        } else if let Some(error) = self.pipeline_create_error.as_ref() {
+            panic!("CreatePipeline failed: {error:#}");
+        } else {
+            panic!("CreatePipeline must be called before this action");
+        }
     }
 
     fn mock_input_consumer(&self) -> &MockInputConsumer {
-        self.mock_input_consumer
-            .as_ref()
-            .expect("CreatePipeline must be called before this action")
+        if let Some(consumer) = self.mock_input_consumer.as_ref() {
+            consumer
+        } else if let Some(error) = self.pipeline_create_error.as_ref() {
+            panic!("CreatePipeline failed: {error:#}");
+        } else {
+            panic!("CreatePipeline must be called before this action");
+        }
     }
 
     fn zset(&self) -> &MockDeZSet<NatsTestRecord, NatsTestRecord> {
-        self.zset
-            .as_ref()
-            .expect("CreatePipeline must be called before this action")
+        if let Some(zset) = self.zset.as_ref() {
+            zset
+        } else if let Some(error) = self.pipeline_create_error.as_ref() {
+            panic!("CreatePipeline failed: {error:#}");
+        } else {
+            panic!("CreatePipeline must be called before this action");
+        }
     }
 
     fn exec(
@@ -185,29 +199,36 @@ impl NatsMockRunner {
                 let config_str = pipeline_config(self.nats_url());
                 println!("Config:\n{config_str}");
 
-                let (endpoint, mock_input_consumer, _parser, zset) =
-                    mock_input_pipeline::<NatsTestRecord, NatsTestRecord>(
-                        serde_yaml::from_str(&config_str).unwrap(),
-                        Relation::empty(),
-                    )
-                    .unwrap();
+                match mock_input_pipeline::<NatsTestRecord, NatsTestRecord>(
+                    serde_yaml::from_str(&config_str).unwrap(),
+                    Relation::empty(),
+                ) {
+                    Ok((endpoint, mock_input_consumer, _parser, zset)) => {
+                        // Reset error state so a fresh pipeline starts clean.
+                        self.got_fatal.store(false, Ordering::Release);
+                        self.error_count.store(0, Ordering::Release);
+                        self.pipeline_create_error = None;
 
-                // Reset got_fatal so a fresh pipeline starts clean.
-                self.got_fatal.store(false, Ordering::Release);
-                self.error_count.store(0, Ordering::Release);
+                        let got_fatal_clone = self.got_fatal.clone();
+                        let error_count_clone = self.error_count.clone();
+                        mock_input_consumer.on_error(Some(Box::new(move |fatal, _err| {
+                            error_count_clone.fetch_add(1, Ordering::AcqRel);
+                            if fatal {
+                                got_fatal_clone.store(true, Ordering::Release);
+                            }
+                        })));
 
-                let got_fatal_clone = self.got_fatal.clone();
-                let error_count_clone = self.error_count.clone();
-                mock_input_consumer.on_error(Some(Box::new(move |fatal, _err| {
-                    error_count_clone.fetch_add(1, Ordering::AcqRel);
-                    if fatal {
-                        got_fatal_clone.store(true, Ordering::Release);
+                        self.endpoint = Some(endpoint);
+                        self.mock_input_consumer = Some(mock_input_consumer);
+                        self.zset = Some(zset);
                     }
-                })));
-
-                self.endpoint = Some(endpoint);
-                self.mock_input_consumer = Some(mock_input_consumer);
-                self.zset = Some(zset);
+                    Err(error) => {
+                        self.endpoint = None;
+                        self.mock_input_consumer = None;
+                        self.zset = None;
+                        self.pipeline_create_error = Some(error);
+                    }
+                }
             }
 
             NatsMockAction::Publish(n) => {
@@ -421,6 +442,15 @@ impl NatsMockRunner {
             }
 
             NatsMockAction::ExpectFatalErrorContains { timeout, needle } => {
+                if let Some(error) = self.pipeline_create_error.as_ref() {
+                    let error_text = format!("{error:#}");
+                    assert!(
+                        error_text.contains(needle),
+                        "Expected fatal error to contain '{needle}', got: {error_text}"
+                    );
+                    return Ok(());
+                }
+
                 let timeout_ms = timeout.as_millis();
                 let endpoint = self.endpoint();
                 let mock_input_consumer = self.mock_input_consumer();

@@ -72,7 +72,6 @@ use xxhash_rust::xxh3::Xxh3Default;
 
 type NatsConsumerConfig = nats_consumer::pull::OrderedConfig;
 type NatsConsumer = nats_consumer::Consumer<NatsConsumerConfig>;
-const NATS_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReaderLifecycleState {
@@ -123,6 +122,11 @@ impl NatsInputEndpoint {
         if config.inactivity_timeout_secs == 0 {
             return Err(anyhow!(
                 "Invalid NATS input configuration: inactivity_timeout_secs must be at least 1 second"
+            ));
+        }
+        if config.retry_interval_secs == 0 {
+            return Err(anyhow!(
+                "Invalid NATS input configuration: retry_interval_secs must be at least 1 second"
             ));
         }
         Ok(Self {
@@ -343,6 +347,7 @@ impl NatsReader {
         let resume_cursor = Arc::new(AtomicU64::new(resume_info.sequence_numbers.end));
         let nats_consumer_config = translate_consumer_options(&config.consumer_config);
         let inactivity_timeout = Duration::from_secs(config.inactivity_timeout_secs);
+        let retry_interval = Duration::from_secs(config.retry_interval_secs);
 
         let mut command_receiver = InputCommandReceiver::<Metadata, ()>::new(command_receiver);
 
@@ -410,7 +415,7 @@ impl NatsReader {
                                 while reader_error_receiver.try_recv().is_ok() {}
                                 state = ReaderLifecycleState::ErrorRetrying;
                                 let error = error.context("NATS reader task failed");
-                                next_retry_at = Some(tokio::time::Instant::now() + NATS_RETRY_INTERVAL);
+                                next_retry_at = Some(tokio::time::Instant::now() + retry_interval);
                                 consumer.error(false, anyhow!("NATS input entered ERROR state: {error:#}"), Some("nats-input"));
                                 continue;
                             }
@@ -423,7 +428,7 @@ impl NatsReader {
                     select! {
                         maybe_error = reader_error_receiver.recv() => {
                             if maybe_error.is_some() {
-                                next_retry_at = Some(tokio::time::Instant::now() + NATS_RETRY_INTERVAL);
+                                next_retry_at = Some(tokio::time::Instant::now() + retry_interval);
                             }
                             continue;
                         }
@@ -450,10 +455,10 @@ impl NatsReader {
                                 Err(StartReaderError::Retryable(error)) => {
                                     consumer.error(
                                         false,
-                                        anyhow!("NATS input still in ERROR state, retrying in {:?}: {error:#}", NATS_RETRY_INTERVAL),
+                                        anyhow!("NATS input still in ERROR state, retrying in {:?}: {error:#}", retry_interval),
                                         Some("nats-input"),
                                     );
-                                    next_retry_at = Some(tokio::time::Instant::now() + NATS_RETRY_INTERVAL);
+                                    next_retry_at = Some(tokio::time::Instant::now() + retry_interval);
                                 }
                                 Err(StartReaderError::Fatal(error)) => {
                                     consumer.error(
@@ -550,7 +555,7 @@ impl NatsReader {
                         }
                         Err(StartReaderError::Retryable(error)) => {
                             state = ReaderLifecycleState::ErrorRetrying;
-                            next_retry_at = Some(tokio::time::Instant::now() + NATS_RETRY_INTERVAL);
+                            next_retry_at = Some(tokio::time::Instant::now() + retry_interval);
                             consumer.error(false, anyhow!("NATS input entered ERROR state: {error:#}"), Some("nats-input"));
                         }
                         Err(StartReaderError::Fatal(error)) => {

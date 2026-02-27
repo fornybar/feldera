@@ -49,6 +49,10 @@ pub const fn default_inactivity_timeout_secs() -> u64 {
     10
 }
 
+pub const fn default_retry_interval_secs() -> u64 {
+    5
+}
+
 /// Options for connecting to a NATS server.
 #[derive(Debug, Clone, Eq, PartialEq, Deserialize, Serialize, ToSchema)]
 pub struct ConnectOptions {
@@ -128,5 +132,9 @@ pub struct NatsInputConfig {
     /// a stream/server health check. Must be at least 1.
     #[serde(default = "default_inactivity_timeout_secs")]
     pub inactivity_timeout_secs: u64,
+    /// Delay between automatic reconnect attempts while in retry mode.
+    /// Must be at least 1.
+    #[serde(default = "default_retry_interval_secs")]
+    pub retry_interval_secs: u64,
     pub consumer_config: ConsumerConfig,
 }

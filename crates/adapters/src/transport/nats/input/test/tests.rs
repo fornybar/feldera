@@ -1063,6 +1063,48 @@ format:
     )
 }
 
+/// Test that retry_interval_secs controls retry cadence in ERROR state.
+#[test]
+fn test_nats_retry_interval_config_is_honored() -> AnyResult<()> {
+    use NatsMockAction::*;
+    run_nats_mock_test(
+        |nats_url| {
+            format!(
+                r#"
+stream: test_input
+transport:
+    name: nats_input
+    config:
+        connection_config:
+            server_url: {nats_url}
+            request_timeout_secs: 1
+        stream_name: missing_stream
+        inactivity_timeout_secs: 1
+        retry_interval_secs: 1
+        consumer_config:
+            deliver_policy: All
+            subjects: [{SUBJECT_NAME}]
+format:
+    name: json
+    config:
+        update_format: raw
+"#
+            )
+        },
+        &[
+            StartNats,
+            CreatePipeline,
+            Extend,
+            WaitForErrorCountAtLeast {
+                count: 3,
+                timeout: Duration::from_secs(4),
+            },
+            Pause,
+            DisconnectAllowNonFatal,
+        ],
+    )
+}
+
 /// Test that inactivity_timeout_secs=0 is rejected early by configuration validation.
 #[test]
 fn test_nats_inactivity_timeout_zero_rejected() {
@@ -1098,4 +1140,41 @@ format:
             );
         }
     }
+}
+
+/// Test that retry_interval_secs=0 is rejected early by configuration validation.
+#[test]
+fn test_nats_retry_interval_zero_rejected() {
+    use NatsMockAction::*;
+    run_nats_mock_test(
+        |_nats_url| {
+            r#"
+stream: test_input
+transport:
+    name: nats_input
+    config:
+        connection_config:
+            server_url: nats://127.0.0.1:4222
+        stream_name: some_stream
+        inactivity_timeout_secs: 1
+        retry_interval_secs: 0
+        consumer_config:
+            deliver_policy: All
+format:
+    name: json
+    config:
+        update_format: raw
+"#
+            .to_string()
+        },
+        &[
+            StartNats,
+            CreatePipeline,
+            ExpectFatalErrorContains {
+                timeout: Duration::from_secs(1),
+                needle: "retry_interval_secs",
+            },
+        ],
+    )
+    .unwrap();
 }
