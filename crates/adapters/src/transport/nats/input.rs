@@ -171,13 +171,27 @@ impl NatsReader {
         // Connect to NATS and verify stream exists (early validation).
         // This ensures we fail fast with a clear error if the server is
         // unreachable or the stream doesn't exist.
+        // The async-nats connection_timeout only bounds the TCP handshake,
+        // not the NATS protocol handshake (INFO/CONNECT/PONG). Wrap the
+        // entire init in an outer timeout to prevent hanging if TCP connects
+        // but the server process is unresponsive.
+        let init_deadline = Duration::from_secs(
+            config.connection_config.connection_timeout_secs
+                + config.connection_config.request_timeout_secs,
+        );
         let (nats_connection, jetstream) = TOKIO
             .block_on(
                 async {
-                    let client = Self::connect_nats(&config.connection_config).await?;
-                    let js = jetstream::new(client.clone());
-                    Self::verify_stream_exists(&js, &config.stream_name).await?;
-                    Ok::<_, AnyError>((client, js))
+                    tokio::time::timeout(init_deadline, async {
+                        let client = Self::connect_nats(&config.connection_config).await?;
+                        let js = jetstream::new(client.clone());
+                        Self::verify_stream_exists(&js, &config.stream_name).await?;
+                        Ok::<_, AnyError>((client, js))
+                    })
+                    .await
+                    .map_err(|_| {
+                        anyhow!("NATS initialization timed out after {init_deadline:?}")
+                    })?
                 }
                 .instrument(span.clone()),
             )
