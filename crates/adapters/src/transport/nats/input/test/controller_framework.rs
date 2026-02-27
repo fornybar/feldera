@@ -36,11 +36,9 @@ pub(super) enum NatsControllerAction {
     /// then stop the pipeline.
     RunFtCycle { publish: usize, checkpoint: bool },
 
-    /// Start the pipeline in a background thread and assert that a fatal
-    /// error appears within a timeout derived from the runner's
-    /// `inactivity_timeout_secs`. Uses a background thread so the test
-    /// doesn't hang if replay loops forever.
-    ExpectStartupFatal,
+    /// Start the pipeline in a background thread and assert startup enters an
+    /// error path (retrying non-fatal or fatal) within timeout.
+    ExpectStartupRetrying,
 }
 
 /// Internal state held by the Controller FT test runner.
@@ -388,32 +386,31 @@ outputs:
                 }
             }
 
-            NatsControllerAction::ExpectStartupFatal => {
+            NatsControllerAction::ExpectStartupRetrying => {
                 assert!(
                     self.controller.is_none(),
-                    "ExpectStartupFatal requires no running controller"
+                    "ExpectStartupRetrying requires no running controller"
                 );
 
-                let got_fatal = Arc::new(AtomicBool::new(false));
-                let got_fatal_clone = got_fatal.clone();
+                let got_error = Arc::new(AtomicBool::new(false));
+                let got_error_clone = got_error.clone();
                 let config = self.pipeline_config().clone();
-
-                let handle = std::thread::spawn(move || {
-                    Controller::with_test_config(
-                        |circuit_config| {
-                            Ok(test_circuit::<TestStruct>(
-                                circuit_config,
-                                &[],
-                                &[Some("output")],
-                            ))
-                        },
-                        &config,
-                        Box::new(move |e, _tag| {
-                            println!("Controller error: {e}");
-                            got_fatal_clone.store(true, Ordering::Release);
-                        }),
-                    )
-                });
+                let controller = Controller::with_test_config(
+                    |circuit_config| {
+                        Ok(test_circuit::<TestStruct>(
+                            circuit_config,
+                            &[],
+                            &[Some("output")],
+                        ))
+                    },
+                    &config,
+                    Box::new(move |e, _tag| {
+                        println!("Controller error: {e}");
+                        got_error_clone.store(true, Ordering::Release);
+                    }),
+                )
+                .unwrap();
+                controller.start();
 
                 let timeout_ms = self
                     .inactivity_timeout_secs
@@ -421,27 +418,31 @@ outputs:
                     .unwrap_or(30_000);
 
                 let result = wait(
-                    || got_fatal.load(Ordering::Acquire) || handle.is_finished(),
+                    || {
+                        got_error.load(Ordering::Acquire)
+                            || controller
+                                .status()
+                                .input_status()
+                                .get(&0)
+                                .unwrap()
+                                .metrics
+                                .num_transport_errors
+                                .load(Ordering::Acquire)
+                                > 0
+                    },
                     timeout_ms,
                 );
 
                 if result.is_err() {
                     eprintln!(
-                        "FAIL: Expected an error within {timeout_ms}ms, but no error was \
-                         reported (replay may be looping forever). Aborting to prevent hang."
+                        "FAIL: Expected a startup error within {timeout_ms}ms, but no error was reported."
                     );
                     std::process::abort();
                 }
 
-                assert!(
-                    got_fatal.load(Ordering::Acquire),
-                    "Expected a fatal error, but the controller initialized without error"
-                );
-
-                if let Ok(Ok(controller)) = handle.join() {
-                    controller.stop().unwrap();
-                }
+                controller.stop().unwrap();
             }
+
         }
         Ok(())
     }

@@ -1,7 +1,6 @@
 use super::NatsTestRecord;
 use super::controller_framework::*;
 use super::mock_framework::*;
-use super::util;
 use crate::test::mock_input_pipeline;
 use anyhow::Result as AnyResult;
 use feldera_types::program_schema::Relation;
@@ -29,10 +28,10 @@ fn test_nats_basic_input_consumption() -> AnyResult<()> {
     )
 }
 
-/// Tests that the connector reports a fatal error when the NATS server
-/// dies mid-run, detected via the inactivity timeout health check.
+/// Retry loop should report non-fatal errors every retry interval while
+/// NATS is down and continue attempting reconnects.
 #[test]
-fn test_nats_server_killed_mid_run_stalls() -> AnyResult<()> {
+fn test_nats_retry_loop_when_server_unavailable() -> AnyResult<()> {
     use NatsMockAction::*;
     run_nats_mock_test(
         nats_stall_config,
@@ -45,19 +44,19 @@ fn test_nats_server_killed_mid_run_stalls() -> AnyResult<()> {
             WaitForRecords(1),
             AssertRecordCount(1),
             KillServer,
-            ExpectFatalErrorContains {
-                timeout: stall_timeout(),
-                needle: "NATS input stalled",
+            WaitForErrorCountAtLeast {
+                count: 2,
+                timeout: Duration::from_secs(12),
             },
-            Disconnect,
+            DisconnectAllowNonFatal,
         ],
     )
 }
 
-/// Tests that the connector reports a fatal error when the stream is
-/// deleted mid-run, detected via the inactivity timeout health check.
+/// Connector should enter retrying ERROR state, then recover automatically
+/// once the server and stream become available again.
 #[test]
-fn test_nats_stream_deleted_mid_run_stalls() -> AnyResult<()> {
+fn test_nats_resume_after_server_becomes_available() -> AnyResult<()> {
     use NatsMockAction::*;
     run_nats_mock_test(
         nats_stall_config,
@@ -69,12 +68,97 @@ fn test_nats_stream_deleted_mid_run_stalls() -> AnyResult<()> {
             Extend,
             WaitForRecords(1),
             AssertRecordCount(1),
-            DeleteStream,
-            ExpectFatalErrorContains {
-                timeout: stall_timeout(),
-                needle: "NATS input stalled",
+            KillServer,
+            WaitForErrorCountAtLeast {
+                count: 1,
+                timeout: Duration::from_secs(8),
             },
-            Disconnect,
+            RestartNatsSamePort,
+            CreateStream,
+            // Resume cursor is 2, so after restart publish enough messages to
+            // include sequences 2.. so at least two new records are consumed.
+            Publish(5),
+            WaitForRecordsNoFatal(5),
+            AssertRecordCount(5),
+            DisconnectAllowNonFatal,
+        ],
+    )
+}
+
+/// PAUSE should stop the retry loop while in ERROR state; RESUME should restart
+/// retries and eventually ingest when availability is restored.
+#[test]
+fn test_nats_pause_during_retry_loop() -> AnyResult<()> {
+    use NatsMockAction::*;
+    run_nats_mock_test(
+        nats_stall_config,
+        &[
+            StartNats,
+            CreateStream,
+            Publish(1),
+            CreatePipeline,
+            Extend,
+            WaitForRecords(1),
+            KillServer,
+            WaitForErrorCountAtLeast {
+                count: 1,
+                timeout: Duration::from_secs(8),
+            },
+            Pause,
+            AssertNoErrorCountIncrease {
+                duration: Duration::from_secs(6),
+            },
+            Extend,
+            WaitForErrorCountAtLeast {
+                count: 2,
+                timeout: Duration::from_secs(8),
+            },
+            RestartNatsSamePort,
+            CreateStream,
+            // Resume cursor is 2 after first record; publish enough records so
+            // sequences >=2 exist in the new stream.
+            Publish(4),
+            WaitForRecordsNoFatal(4),
+            AssertRecordCount(4),
+            DisconnectAllowNonFatal,
+        ],
+    )
+}
+
+/// Tests that pausing while the reader is Running and may have queued an error
+/// (e.g. server just died) does not cause the next Extend to immediately enter
+/// ErrorRetrying due to a stale error left in the channel.
+///
+/// Sequence: consume 1 record → kill server → pause immediately (reader error
+/// may already be in-flight) → restart server + recreate stream → extend →
+/// new records should arrive without spurious error-retry transitions.
+#[test]
+fn test_nats_no_stale_error_after_pause_extend() -> AnyResult<()> {
+    use NatsMockAction::*;
+    run_nats_mock_test(
+        nats_stall_config,
+        &[
+            StartNats,
+            CreateStream,
+            Publish(1),
+            CreatePipeline,
+            Extend,
+            WaitForRecords(1),
+            AssertRecordCount(1),
+            // Kill server — the reader task will notice and send an error,
+            // but we pause immediately so the worker may not have processed it yet.
+            KillServer,
+            Pause,
+            // Restart server and recreate stream before extending.
+            RestartNatsSamePort,
+            CreateStream,
+            // Resume cursor is 2 after the first record; publish records with
+            // sequences >= 2.
+            Publish(3),
+            Extend,
+            WaitForRecordsNoFatal(3),
+            AssertRecordCount(3),
+            DisconnectAllowNonFatal,
         ],
     )
 }
@@ -190,7 +274,7 @@ fn test_nats_mid_run_server_restart_recovers_no_fatal() -> AnyResult<()> {
     )
 }
 
-/// Tests that inactivity_timeout_secs is honored approximately (with slack).
+/// Tests that inactivity timeout still drives first transport error emission.
 #[test]
 fn test_nats_inactivity_timeout_config_is_honored() -> AnyResult<()> {
     use NatsMockAction::*;
@@ -204,12 +288,11 @@ fn test_nats_inactivity_timeout_config_is_honored() -> AnyResult<()> {
             Extend,
             WaitForRecords(1),
             KillServer,
-            // Fatal should not be immediate, and should arrive within a bounded window.
-            ExpectFatalErrorWithin {
-                min: Duration::from_millis(700),
-                max: Duration::from_secs(6),
+            WaitForErrorCountAtLeast {
+                count: 1,
+                timeout: Duration::from_secs(6),
             },
-            Disconnect,
+            DisconnectAllowNonFatal,
         ],
     )
 }
@@ -747,7 +830,7 @@ fn test_nats_ft_replay_after_stream_purge() -> AnyResult<()> {
                 checkpoint: false,
             },
             PurgeStream,
-            ExpectStartupFatal,
+            ExpectStartupRetrying,
         ],
     )
 }
@@ -805,8 +888,8 @@ fn test_nats_ft_stream_deletion_and_recreation() -> AnyResult<()> {
             DeleteStream,
             CreateStream,
             // Restart: FT framework tries to replay uncommitted sequences,
-            // but they don't exist in the fresh stream -> fatal error.
-            ExpectStartupFatal,
+            // but they don't exist in the fresh stream -> startup error/retry.
+            ExpectStartupRetrying,
         ],
     )
 }
@@ -831,149 +914,117 @@ fn test_nats_ft_stream_deletion_after_full_checkpoint() -> AnyResult<()> {
             // so nothing needs replaying.
             DeleteStream,
             CreateStream,
-            // Resume metadata points at old stream sequence space; startup must fail.
-            ExpectStartupFatal,
+            // Resume metadata points at old stream sequence space; startup errors/retries.
+            ExpectStartupRetrying,
         ],
     )
 }
 
-/// Helper to assert that a connection error contains expected context.
-fn assert_nats_connect_error(
-    result: AnyResult<(
-        Box<dyn crate::InputReader>,
-        crate::test::MockInputConsumer,
-        crate::test::MockInputParser,
-        crate::test::MockDeZSet<NatsTestRecord, NatsTestRecord>,
-    )>,
-    expected_url: &str,
-    expected_cause: &str,
-) {
-    match result {
-        Ok(_) => panic!("Expected connection to fail"),
-        Err(err) => {
-            let err_msg = format!("{err:#}"); // Full error chain
-            assert!(
-                err_msg.contains(expected_url),
-                "Error message should contain server URL, got: {err_msg}"
-            );
-            assert!(
-                err_msg.contains("Failed to connect"),
-                "Error message should indicate connection failure, got: {err_msg}"
-            );
-            assert!(
-                err_msg.contains(expected_cause),
-                "Error message should contain cause '{expected_cause}', got: {err_msg}"
-            );
-        }
-    }
-}
-
-/// Test that connecting to a non-existent server (connection refused) produces
-/// a clear error message with the server URL included.
+/// Test that startup no longer fails fast: unavailable server should trigger
+/// retrying non-fatal errors after `Extend`.
 #[test]
-fn test_nats_connection_refused_error() {
+fn test_nats_connection_refused_enters_retry_loop() -> AnyResult<()> {
+    use NatsMockAction::*;
     let nonexistent_url = "nats://127.0.0.1:59999";
-
-    let config_str = format!(
-        r#"
+    run_nats_mock_test(
+        |_: &str| {
+            format!(
+                r#"
 stream: test_input
 transport:
     name: nats_input
     config:
         connection_config:
             server_url: {nonexistent_url}
-        stream_name: my_stream
+            request_timeout_secs: 1
+        stream_name: {STREAM_NAME}
+        inactivity_timeout_secs: 1
         consumer_config:
             deliver_policy: All
+            subjects: [{SUBJECT_NAME}]
 format:
     name: json
     config:
         update_format: raw
 "#
-    );
-
-    let result = mock_input_pipeline::<NatsTestRecord, NatsTestRecord>(
-        serde_yaml::from_str(&config_str).unwrap(),
-        Relation::empty(),
-    );
-
-    assert_nats_connect_error(result, nonexistent_url, "Connection refused");
+            )
+        },
+        &[
+            StartNats,
+            CreatePipeline,
+            Extend,
+            WaitForErrorCountAtLeast {
+                count: 1,
+                timeout: Duration::from_secs(8),
+            },
+            Pause,
+            DisconnectAllowNonFatal,
+        ],
+    )
 }
 
-/// Test that connecting to a valid server but requesting a non-existent stream
-/// produces a clear error message with the stream name.
+/// Test that missing stream enters retry loop instead of failing pipeline open.
 #[test]
-fn test_nats_stream_not_found_error() {
-    let (_nats_process_guard, nats_url) = util::start_nats_and_get_address().unwrap();
-
-    // Wait for NATS to be ready
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    rt.block_on(async {
-        util::wait_for_nats_ready(&nats_url, Duration::from_secs(5))
-            .await
-            .unwrap();
-    });
-
-    let nonexistent_stream = "this_stream_does_not_exist";
-
-    let config_str = format!(
-        r#"
+fn test_nats_stream_not_found_enters_retry_loop() -> AnyResult<()> {
+    use NatsMockAction::*;
+    run_nats_mock_test(
+        |nats_url| {
+            format!(
+                r#"
 stream: test_input
 transport:
     name: nats_input
     config:
         connection_config:
             server_url: {nats_url}
-        stream_name: {nonexistent_stream}
+            request_timeout_secs: 1
+        stream_name: this_stream_does_not_exist
+        inactivity_timeout_secs: 1
         consumer_config:
             deliver_policy: All
+            subjects: [{SUBJECT_NAME}]
 format:
     name: json
     config:
         update_format: raw
 "#
-    );
-
-    let result = mock_input_pipeline::<NatsTestRecord, NatsTestRecord>(
-        serde_yaml::from_str(&config_str).unwrap(),
-        Relation::empty(),
-    );
-
-    match result {
-        Ok(_) => panic!("Expected stream lookup to fail"),
-        Err(err) => {
-            let err_msg = format!("{err:#}"); // Full error chain
-            // The error message should contain the stream name for easy debugging
-            assert!(
-                err_msg.contains(nonexistent_stream),
-                "Error message should contain stream name, got: {err_msg}"
-            );
-            assert!(
-                err_msg.contains("Failed to get stream"),
-                "Error message should indicate stream lookup failure, got: {err_msg}"
-            );
-        }
-    }
+            )
+        },
+        &[
+            StartNats,
+            CreatePipeline,
+            Extend,
+            WaitForErrorCountAtLeast {
+                count: 1,
+                timeout: Duration::from_secs(8),
+            },
+            Pause,
+            DisconnectAllowNonFatal,
+        ],
+    )
 }
 
-/// Test that connection timeout option is respected.
+/// Test that connection timeout contributes to retry cadence instead of blocking open.
 #[test]
-fn test_nats_connection_timeout() {
+fn test_nats_connection_timeout() -> AnyResult<()> {
+    use NatsMockAction::*;
     // Use a non-routable IP address that will cause a connection timeout
     // 10.255.255.1 is a reserved address that should not respond
     let non_routable_url = "nats://10.255.255.1:4222";
-    let timeout_secs = 1;
-
-    let config_str = format!(
-        r#"
+    run_nats_mock_test(
+        |_: &str| {
+            format!(
+                r#"
 stream: test_input
 transport:
     name: nats_input
     config:
         connection_config:
             server_url: {non_routable_url}
-            connection_timeout_secs: {timeout_secs}
+            connection_timeout_secs: 1
+            request_timeout_secs: 1
         stream_name: some_stream
+        inactivity_timeout_secs: 1
         consumer_config:
             deliver_policy: All
 format:
@@ -981,27 +1032,20 @@ format:
     config:
         update_format: raw
 "#
-    );
-
-    let start = std::time::Instant::now();
-
-    let result = mock_input_pipeline::<NatsTestRecord, NatsTestRecord>(
-        serde_yaml::from_str(&config_str).unwrap(),
-        Relation::empty(),
-    );
-
-    let elapsed = start.elapsed();
-
-    // Should fail within a reasonable time relative to the timeout
-    // Allow some slack for test execution overhead
-    let max_expected = Duration::from_secs(timeout_secs + 3);
-    assert!(
-        elapsed < max_expected,
-        "Connection should timeout within ~{timeout_secs}s, took {:?}",
-        elapsed
-    );
-
-    assert_nats_connect_error(result, non_routable_url, "timed out");
+            )
+        },
+        &[
+            StartNats,
+            CreatePipeline,
+            Extend,
+            WaitForErrorCountAtLeast {
+                count: 1,
+                timeout: Duration::from_secs(10),
+            },
+            Pause,
+            DisconnectAllowNonFatal,
+        ],
+    )
 }
 
 /// Test that inactivity_timeout_secs=0 is rejected early by configuration validation.

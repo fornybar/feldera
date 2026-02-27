@@ -8,7 +8,7 @@ use anyhow::Result as AnyResult;
 use feldera_types::program_schema::Relation;
 use serde_json::json;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -36,6 +36,8 @@ pub(super) enum NatsMockAction {
 
     /// Call `endpoint.extend()` to start reading.
     Extend,
+    /// Call `endpoint.pause()` to stop ingest/retry loop.
+    Pause,
     /// Queue repeatedly until `n` total records have been flushed to the zset.
     /// Aborts early with an error if a fatal endpoint error is detected.
     WaitForRecords(usize),
@@ -77,6 +79,10 @@ pub(super) enum NatsMockAction {
         timeout: Duration,
         needle: &'static str,
     },
+    /// Wait until `error_count` reaches at least `count`.
+    WaitForErrorCountAtLeast { count: usize, timeout: Duration },
+    /// Assert that no additional endpoint errors are reported for `duration`.
+    AssertNoErrorCountIncrease { duration: Duration },
 
     /// Verify that `count` output records starting at `output_index` match
     /// the corresponding published records. The NATS sequence is derived
@@ -109,6 +115,7 @@ struct NatsMockRunner {
     mock_input_consumer: Option<MockInputConsumer>,
     zset: Option<MockDeZSet<NatsTestRecord, NatsTestRecord>>,
     got_fatal: Arc<AtomicBool>,
+    error_count: Arc<AtomicUsize>,
     rt: tokio::runtime::Runtime,
 }
 
@@ -127,6 +134,7 @@ impl NatsMockRunner {
             mock_input_consumer: None,
             zset: None,
             got_fatal: Arc::new(AtomicBool::new(false)),
+            error_count: Arc::new(AtomicUsize::new(0)),
             rt: tokio::runtime::Runtime::new()?,
         })
     }
@@ -186,9 +194,12 @@ impl NatsMockRunner {
 
                 // Reset got_fatal so a fresh pipeline starts clean.
                 self.got_fatal.store(false, Ordering::Release);
+                self.error_count.store(0, Ordering::Release);
 
                 let got_fatal_clone = self.got_fatal.clone();
+                let error_count_clone = self.error_count.clone();
                 mock_input_consumer.on_error(Some(Box::new(move |fatal, _err| {
+                    error_count_clone.fetch_add(1, Ordering::AcqRel);
                     if fatal {
                         got_fatal_clone.store(true, Ordering::Release);
                     }
@@ -212,6 +223,10 @@ impl NatsMockRunner {
 
             NatsMockAction::Extend => {
                 self.endpoint().extend();
+            }
+
+            NatsMockAction::Pause => {
+                self.endpoint().pause();
             }
 
             NatsMockAction::WaitForRecords(n) => {
@@ -436,6 +451,36 @@ impl NatsMockRunner {
                 assert!(
                     error_text.contains(needle),
                     "Expected fatal error to contain '{needle}', got: {error_text}"
+                );
+            }
+
+            NatsMockAction::WaitForErrorCountAtLeast { count, timeout } => {
+                let timeout_ms = timeout.as_millis();
+                let endpoint = self.endpoint();
+                let count = *count;
+                wait(
+                    || {
+                        endpoint.queue(false);
+                        self.error_count.load(Ordering::Acquire) >= count
+                    },
+                    timeout_ms,
+                )
+                .map_err(|()| {
+                    anyhow::anyhow!(
+                        "Timed out after {timeout_ms}ms waiting for endpoint error count >= {count}; got {}",
+                        self.error_count.load(Ordering::Acquire)
+                    )
+                })?;
+            }
+
+            NatsMockAction::AssertNoErrorCountIncrease { duration } => {
+                let start = self.error_count.load(Ordering::Acquire);
+                sleep(*duration);
+                let end = self.error_count.load(Ordering::Acquire);
+                assert_eq!(
+                    start, end,
+                    "Expected no additional endpoint errors during {:?}, but count increased from {start} to {end}",
+                    duration
                 );
             }
 

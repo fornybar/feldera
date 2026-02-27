@@ -67,11 +67,20 @@ use tokio::{
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{Instrument, debug, error, info, info_span};
+use tracing::{Instrument, debug, info, info_span};
 use xxhash_rust::xxh3::Xxh3Default;
 
 type NatsConsumerConfig = nats_consumer::pull::OrderedConfig;
 type NatsConsumer = nats_consumer::Consumer<NatsConsumerConfig>;
+const NATS_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReaderLifecycleState {
+    Running,
+    ErrorRetrying,
+    Paused,
+    Stopped,
+}
 
 /// Checkpoint/resume metadata
 ///
@@ -168,59 +177,11 @@ impl NatsReader {
         );
         let (command_sender, command_receiver) = unbounded_channel();
 
-        // Connect to NATS and verify stream exists (early validation).
-        // This ensures we fail fast with a clear error if the server is
-        // unreachable or the stream doesn't exist.
-        // The async-nats connection_timeout only bounds the TCP handshake,
-        // not the NATS protocol handshake (INFO/CONNECT/PONG). Wrap the
-        // entire init in an outer timeout to prevent hanging if TCP connects
-        // but the server process is unresponsive.
-        let init_deadline = Duration::from_secs(
-            config.connection_config.connection_timeout_secs
-                + config.connection_config.request_timeout_secs,
-        );
-        let (nats_connection, jetstream) = TOKIO
-            .block_on(
-                async {
-                    tokio::time::timeout(init_deadline, async {
-                        let client = Self::connect_nats(&config.connection_config).await?;
-                        let js = jetstream::new(client.clone());
-                        Self::verify_stream_exists(&js, &config.stream_name).await?;
-                        Ok::<_, AnyError>((client, js))
-                    })
-                    .await
-                    .map_err(|_| anyhow!("NATS initialization timed out after {init_deadline:?}"))?
-                }
-                .instrument(span.clone()),
-            )
-            .map_err(|e| {
-                error!(
-                    server_url = %config.connection_config.server_url,
-                    stream_name = %config.stream_name,
-                    connection_timeout_secs = config.connection_config.connection_timeout_secs,
-                    request_timeout_secs = config.connection_config.request_timeout_secs,
-                    "NATS initialization failed: {e:#}"
-                );
-                e.context(format!(
-                    "NATS initialization failed for stream '{}' at server '{}' \
-                (connection_timeout={}s, request_timeout={}s)",
-                    config.stream_name,
-                    config.connection_config.server_url,
-                    config.connection_config.connection_timeout_secs,
-                    config.connection_config.request_timeout_secs,
-                ))
-            })?;
-
-        // The connection is established but we don't need the client reference
-        // in the worker - it stays alive as long as the jetstream context exists.
-        drop(nats_connection);
-
         let consumer_clone = consumer.clone();
         TOKIO.spawn(async move {
             Self::worker_task(
                 config,
                 resume_info,
-                jetstream,
                 consumer_clone,
                 parser,
                 command_receiver,
@@ -288,19 +249,45 @@ impl NatsReader {
         .map_err(|_| anyhow!("health check timed out after {deadline:?}"))?
     }
 
-    async fn worker_task(
-        config: Arc<NatsInputConfig>,
-        resume_info: Metadata,
-        jetstream: jetstream::Context,
+    async fn initialize_jetstream(
+        connection_config: &cfg::ConnectOptions,
+        stream_name: &str,
+    ) -> AnyResult<jetstream::Context> {
+        let init_deadline = Duration::from_secs(
+            connection_config.connection_timeout_secs + connection_config.request_timeout_secs,
+        );
+        tokio::time::timeout(init_deadline, async {
+            let client = Self::connect_nats(connection_config).await?;
+            let js = jetstream::new(client);
+            Self::verify_stream_exists(&js, stream_name).await?;
+            Ok::<_, AnyError>(js)
+        })
+        .await
+        .map_err(|_| anyhow!("NATS initialization timed out after {init_deadline:?}"))?
+    }
+
+    async fn try_start_stream_reader(
+        config: &Arc<NatsInputConfig>,
+        nats_consumer_config: &NatsConsumerConfig,
+        resume_cursor: Arc<AtomicU64>,
+        queue: Arc<InputQueue<u64>>,
         consumer: Box<dyn InputConsumer>,
         parser: Box<dyn Parser>,
-        command_receiver: UnboundedReceiver<InputReaderCommand>,
-    ) -> Result<(), AnyError> {
-        let mut canceller: Option<Canceller> = None;
-        let queue = Arc::new(InputQueue::<u64>::new(consumer.clone()));
-        let resume_cursor = Arc::new(AtomicU64::new(resume_info.sequence_numbers.end));
-        let nats_consumer_config = translate_consumer_options(&config.consumer_config);
-        let inactivity_timeout = Duration::from_secs(config.inactivity_timeout_secs);
+        inactivity_timeout: Duration,
+        reader_error_sender: UnboundedSender<AnyError>,
+    ) -> AnyResult<Canceller> {
+        let jetstream = Self::initialize_jetstream(&config.connection_config, &config.stream_name)
+            .await
+            .with_context(|| {
+                format!(
+                    "NATS initialization failed for stream '{}' at server '{}' \
+                (connection_timeout={}s, request_timeout={}s)",
+                    config.stream_name,
+                    config.connection_config.server_url,
+                    config.connection_config.connection_timeout_secs,
+                    config.connection_config.request_timeout_secs,
+                )
+            })?;
 
         validate_resume_position(
             &jetstream,
@@ -309,12 +296,62 @@ impl NatsReader {
         )
         .await?;
 
+        let nats_consumer = create_nats_consumer(
+            &jetstream,
+            nats_consumer_config,
+            &config.stream_name,
+            resume_cursor.load(Ordering::Acquire),
+        )
+        .await?;
+
+        spawn_nats_reader(
+            jetstream,
+            nats_consumer,
+            resume_cursor,
+            queue,
+            config.connection_config.clone(),
+            config.stream_name.clone(),
+            inactivity_timeout,
+            consumer,
+            parser,
+            reader_error_sender,
+        )
+        .await
+    }
+
+    async fn worker_task(
+        config: Arc<NatsInputConfig>,
+        resume_info: Metadata,
+        consumer: Box<dyn InputConsumer>,
+        parser: Box<dyn Parser>,
+        command_receiver: UnboundedReceiver<InputReaderCommand>,
+    ) -> Result<(), AnyError> {
+        let mut state = ReaderLifecycleState::Paused;
+        let mut canceller: Option<Canceller> = None;
+        let mut last_retry_error: Option<AnyError> = None;
+        let mut next_retry_at: Option<tokio::time::Instant> = None;
+        let (reader_error_sender, mut reader_error_receiver) = unbounded_channel::<AnyError>();
+        let queue = Arc::new(InputQueue::<u64>::new(consumer.clone()));
+        let resume_cursor = Arc::new(AtomicU64::new(resume_info.sequence_numbers.end));
+        let nats_consumer_config = translate_consumer_options(&config.consumer_config);
+        let inactivity_timeout = Duration::from_secs(config.inactivity_timeout_secs);
+
         let mut command_receiver = InputCommandReceiver::<Metadata, ()>::new(command_receiver);
 
         // Handle replay commands
         while let Some((metadata, ())) = command_receiver.recv_replay().await? {
             info!("Attempt to replay: {:?}", metadata);
             if !metadata.sequence_numbers.is_empty() {
+                let jetstream = Self::initialize_jetstream(&config.connection_config, &config.stream_name)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "NATS replay initialization failed for stream '{}' at server '{}'",
+                            config.stream_name,
+                            config.connection_config.server_url,
+                        )
+                    })?;
+
                 validate_replay_range(&jetstream, &config.stream_name, &metadata.sequence_numbers)
                     .await?;
 
@@ -352,7 +389,79 @@ impl NatsReader {
         }
 
         loop {
-            let command = command_receiver.recv().await?;
+            let command = match state {
+                ReaderLifecycleState::Running => {
+                    select! {
+                        maybe_error = reader_error_receiver.recv() => {
+                            if let Some(error) = maybe_error {
+                                if let Some(canceller) = canceller.take() {
+                                    canceller.cancel_and_join().await;
+                                }
+                                // Drain any additional errors queued before cancellation
+                                // to prevent stale errors from affecting the next reader.
+                                while reader_error_receiver.try_recv().is_ok() {}
+                                state = ReaderLifecycleState::ErrorRetrying;
+                                last_retry_error = Some(error.context("NATS reader task failed"));
+                                next_retry_at = Some(tokio::time::Instant::now() + NATS_RETRY_INTERVAL);
+                                if let Some(error) = last_retry_error.as_ref() {
+                                    consumer.error(false, anyhow!("NATS input entered ERROR state: {error:#}"), Some("nats-input"));
+                                }
+                                continue;
+                            }
+                            continue;
+                        }
+                        command = command_receiver.recv() => command?,
+                    }
+                }
+                ReaderLifecycleState::ErrorRetrying => {
+                    select! {
+                        maybe_error = reader_error_receiver.recv() => {
+                            if let Some(error) = maybe_error {
+                                last_retry_error = Some(error.context("NATS reader task failed"));
+                                next_retry_at = Some(tokio::time::Instant::now() + NATS_RETRY_INTERVAL);
+                            }
+                            continue;
+                        }
+                        _ = tokio::time::sleep_until(next_retry_at.expect("retry deadline should be set")) => {
+                            match Self::try_start_stream_reader(
+                                &config,
+                                &nats_consumer_config,
+                                resume_cursor.clone(),
+                                queue.clone(),
+                                consumer.clone(),
+                                parser.fork(),
+                                inactivity_timeout,
+                                reader_error_sender.clone(),
+                            ).await {
+                                Ok(new_canceller) => {
+                                    info!("NATS input recovered and resumed from {:?}", resume_cursor.load(Ordering::Acquire));
+                                    // Drain stale errors from the previous (failed) reader
+                                    // before entering Running with a fresh reader.
+                                    while reader_error_receiver.try_recv().is_ok() {}
+                                    canceller = Some(new_canceller);
+                                    state = ReaderLifecycleState::Running;
+                                    last_retry_error = None;
+                                    next_retry_at = None;
+                                }
+                                Err(error) => {
+                                    consumer.error(
+                                        false,
+                                        anyhow!("NATS input still in ERROR state, retrying in {:?}: {error:#}", NATS_RETRY_INTERVAL),
+                                        Some("nats-input"),
+                                    );
+                                    last_retry_error = Some(error);
+                                    next_retry_at = Some(tokio::time::Instant::now() + NATS_RETRY_INTERVAL);
+                                }
+                            }
+                            continue;
+                        }
+                        command = command_receiver.recv() => command?,
+                    }
+                }
+                ReaderLifecycleState::Paused => command_receiver.recv().await?,
+                ReaderLifecycleState::Stopped => break,
+            };
+
             match command {
                 command @ InputReaderCommand::Replay { .. } => {
                     unreachable!("{command:?} must be at the beginning of the command stream")
@@ -396,35 +505,53 @@ impl NatsReader {
                     if let Some(canceller) = canceller.take() {
                         canceller.cancel_and_join().await;
                     }
+                    // Drain errors sent by the reader before/during cancellation
+                    // so they don't leak into the next Extend cycle.
+                    while reader_error_receiver.try_recv().is_ok() {}
+                    state = ReaderLifecycleState::Paused;
+                    last_retry_error = None;
+                    next_retry_at = None;
                 }
                 InputReaderCommand::Extend => {
                     info!("Extend from {:?}", resume_cursor.load(Ordering::Acquire));
-                    if canceller.is_none() {
-                        let nats_consumer = create_nats_consumer(
-                            &jetstream,
-                            &nats_consumer_config,
-                            &config.stream_name,
-                            resume_cursor.load(Ordering::Acquire),
-                        )
-                        .await?;
-
-                        canceller = Some(
-                            spawn_nats_reader(
-                                jetstream.clone(),
-                                nats_consumer,
-                                resume_cursor.clone(),
-                                queue.clone(),
-                                config.connection_config.clone(),
-                                config.stream_name.clone(),
-                                inactivity_timeout,
-                                consumer.clone(),
-                                parser.fork(),
-                            )
-                            .await?,
-                        );
+                    if matches!(state, ReaderLifecycleState::Running) {
+                        continue;
+                    }
+                    // Drain stale errors from a previous reader so they don't
+                    // immediately trigger ErrorRetrying for the new reader.
+                    while reader_error_receiver.try_recv().is_ok() {}
+                    match Self::try_start_stream_reader(
+                        &config,
+                        &nats_consumer_config,
+                        resume_cursor.clone(),
+                        queue.clone(),
+                        consumer.clone(),
+                        parser.fork(),
+                        inactivity_timeout,
+                        reader_error_sender.clone(),
+                    )
+                    .await
+                    {
+                        Ok(new_canceller) => {
+                            state = ReaderLifecycleState::Running;
+                            canceller = Some(new_canceller);
+                            last_retry_error = None;
+                            next_retry_at = None;
+                        }
+                        Err(error) => {
+                            state = ReaderLifecycleState::ErrorRetrying;
+                            last_retry_error = Some(error);
+                            next_retry_at = Some(tokio::time::Instant::now() + NATS_RETRY_INTERVAL);
+                            if let Some(error) = last_retry_error.as_ref() {
+                                consumer.error(false, anyhow!("NATS input entered ERROR state: {error:#}"), Some("nats-input"));
+                            }
+                        }
                     }
                 }
-                InputReaderCommand::Disconnect => break,
+                InputReaderCommand::Disconnect => {
+                    state = ReaderLifecycleState::Stopped;
+                    next_retry_at = None;
+                }
             }
         }
         if let Some(canceller) = canceller.take() {
@@ -596,6 +723,7 @@ async fn spawn_nats_reader(
     inactivity_timeout: Duration,
     consumer: Box<dyn InputConsumer>,
     mut parser: Box<dyn Parser>,
+    reader_error_sender: UnboundedSender<AnyError>,
 ) -> AnyResult<Canceller> {
     let mut nats_messages = nats_consumer.messages().await?;
 
@@ -612,7 +740,7 @@ async fn spawn_nats_reader(
                         match result {
                             Ok(result) => {
                                 let Some(result) = result else {
-                                    consumer.error(true, anyhow!("Unexpected end of NATS stream"), Some("nats-input"));
+                                    let _ = reader_error_sender.send(anyhow!("Unexpected end of NATS stream"));
                                     return;
                                 };
                                 match result {
@@ -631,7 +759,8 @@ async fn spawn_nats_reader(
                                         queue.push_with_aux(parser.parse(data, None), Utc::now(), info.stream_sequence);
                                     }
                                     Err(error) => {
-                                        consumer.error(false, anyhow!("NATS error: {error}"), Some("nats-input"));
+                                        let _ = reader_error_sender.send(anyhow!("NATS message stream error: {error}"));
+                                        return;
                                     }
                                 }
                             }
@@ -643,7 +772,7 @@ async fn spawn_nats_reader(
                                     inactivity_timeout,
                                     "input",
                                 ).await {
-                                    consumer.error(true, error, Some("nats-input"));
+                                    let _ = reader_error_sender.send(error);
                                     return;
                                 }
                             }
