@@ -256,13 +256,24 @@ impl NatsReader {
         connection_config: &cfg::ConnectOptions,
         stream_name: &str,
     ) -> Result<(), AnyError> {
-        let client = Self::connect_nats(connection_config)
-            .await
-            .context("server health check failed")?;
-        let js = jetstream::new(client);
-        Self::verify_stream_exists(&js, stream_name)
-            .await
-            .with_context(|| format!("stream '{stream_name}' health check failed"))
+        // The async-nats connection_timeout only bounds the TCP handshake,
+        // not the NATS protocol handshake (INFO/CONNECT/PONG). Wrap the
+        // entire health check in an outer timeout to prevent hanging if
+        // TCP connects but the server process is unresponsive.
+        let deadline = Duration::from_secs(
+            connection_config.connection_timeout_secs + connection_config.request_timeout_secs,
+        );
+        tokio::time::timeout(deadline, async {
+            let client = Self::connect_nats(connection_config)
+                .await
+                .context("server health check failed")?;
+            let js = jetstream::new(client);
+            Self::verify_stream_exists(&js, stream_name)
+                .await
+                .with_context(|| format!("stream '{stream_name}' health check failed"))
+        })
+        .await
+        .map_err(|_| anyhow!("health check timed out after {deadline:?}"))?
     }
 
     async fn worker_task(
