@@ -469,6 +469,26 @@ async fn create_nats_consumer(
         })
 }
 
+/// Runs a health check after an inactivity timeout fires.
+///
+/// Returns `Ok(())` if the server and stream are healthy (caller should
+/// continue its loop), or an error describing the stall and the failed check.
+async fn check_inactivity_health(
+    connection_config: &cfg::ConnectOptions,
+    stream_name: &str,
+    inactivity_timeout: Duration,
+    context: &str,
+) -> Result<(), AnyError> {
+    NatsReader::verify_server_and_stream_health(connection_config, stream_name)
+        .await
+        .map_err(|error| {
+            anyhow!(
+                "NATS {context} stalled for {:?} and {error:#}",
+                inactivity_timeout,
+            )
+        })
+}
+
 async fn consume_nats_messages_until(
     nats_consumer: NatsConsumer,
     last_message_sequence: u64,
@@ -487,17 +507,14 @@ async fn consume_nats_messages_until(
         let Some(result) = (match next_result {
             Ok(result) => result,
             Err(_) => {
-                match NatsReader::verify_server_and_stream_health(connection_config, stream_name)
-                    .await
-                {
-                    Ok(()) => continue,
-                    Err(error) => {
-                        return Err(anyhow!(
-                            "NATS replay stalled for {:?} and {error:#}",
-                            inactivity_timeout,
-                        ));
-                    }
-                }
+                check_inactivity_health(
+                    connection_config,
+                    stream_name,
+                    inactivity_timeout,
+                    "replay",
+                )
+                .await?;
+                continue;
             }
         }) else {
             return Err(anyhow!("Unexpected end of NATS stream"));
@@ -604,19 +621,14 @@ async fn spawn_nats_reader(
                                 }
                             }
                             Err(_) => {
-                                match NatsReader::verify_server_and_stream_health(&connection_config, &stream_name).await {
-                                    Ok(()) => (),
-                                    Err(error) => {
-                                        consumer.error(
-                                            true,
-                                            anyhow!(
-                                                "NATS input stalled for {:?} and {error:#}",
-                                                inactivity_timeout,
-                                            ),
-                                            Some("nats-input"),
-                                        );
-                                        return;
-                                    }
+                                if let Err(error) = check_inactivity_health(
+                                    &connection_config,
+                                    &stream_name,
+                                    inactivity_timeout,
+                                    "input",
+                                ).await {
+                                    consumer.error(true, error, Some("nats-input"));
+                                    return;
                                 }
                             }
                         }
