@@ -488,7 +488,6 @@ outputs:
 
                 controller.stop().unwrap();
             }
-
         }
         Ok(())
     }

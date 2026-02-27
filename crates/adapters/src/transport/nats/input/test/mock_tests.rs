@@ -375,6 +375,51 @@ format:
     )
 }
 
+/// Test that pausing while a startup retry attempt is in-flight interrupts the
+/// attempt instead of waiting for connect/request timeouts to elapse.
+#[test]
+fn test_nats_pause_interrupts_inflight_retry_attempt() -> AnyResult<()> {
+    use NatsMockAction::*;
+    // Use a non-routable IP address that causes a long connect timeout.
+    let non_routable_url = "nats://10.255.255.1:4222";
+    run_nats_mock_test(
+        |_: &str| {
+            format!(
+                r#"
+stream: test_input
+transport:
+    name: nats_input
+    config:
+        connection_config:
+            server_url: {non_routable_url}
+            connection_timeout_secs: 8
+            request_timeout_secs: 8
+        stream_name: some_stream
+        inactivity_timeout_secs: 1
+        retry_interval_secs: 1
+        consumer_config:
+            deliver_policy: All
+format:
+    name: json
+    config:
+        update_format: raw
+"#
+            )
+        },
+        &[
+            StartNats,
+            CreatePipeline,
+            Extend,
+            Sleep(Duration::from_millis(150)),
+            Pause,
+            AssertNoErrorCountIncrease {
+                duration: Duration::from_secs(3),
+            },
+            DisconnectAllowNonFatal,
+        ],
+    )
+}
+
 /// Test that retry_interval_secs controls retry cadence in ERROR state.
 #[test]
 fn test_nats_retry_interval_config_is_honored() -> AnyResult<()> {

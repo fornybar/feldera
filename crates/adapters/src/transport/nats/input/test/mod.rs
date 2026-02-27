@@ -1,8 +1,8 @@
 use feldera_types::deserialize_without_context;
 use serde::{Deserialize, Serialize};
 
-mod controller_framework;
 mod control_tests;
+mod controller_framework;
 mod custom_tests;
 mod mock_framework;
 mod mock_tests;
