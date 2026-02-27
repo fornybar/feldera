@@ -333,6 +333,7 @@ impl NatsReader {
                 // Since range is exclusive, last message to reply is (end-1).
                 let last_message_sequence = metadata.sequence_numbers.end - 1;
                 let (hasher, buffer_size) = consume_nats_messages_until(
+                    &jetstream,
                     nats_consumer,
                     last_message_sequence,
                     &config.connection_config,
@@ -407,6 +408,7 @@ impl NatsReader {
 
                         canceller = Some(
                             spawn_nats_reader(
+                                jetstream.clone(),
                                 nats_consumer,
                                 next_sequence.clone(),
                                 queue.clone(),
@@ -474,22 +476,32 @@ async fn create_nats_consumer(
 /// Returns `Ok(())` if the server and stream are healthy (caller should
 /// continue its loop), or an error describing the stall and the failed check.
 async fn check_inactivity_health(
+    jetstream: &jetstream::Context,
     connection_config: &cfg::ConnectOptions,
     stream_name: &str,
     inactivity_timeout: Duration,
     context: &str,
 ) -> Result<(), AnyError> {
-    NatsReader::verify_server_and_stream_health(connection_config, stream_name)
-        .await
-        .map_err(|error| {
-            anyhow!(
-                "NATS {context} stalled for {:?} and {error:#}",
-                inactivity_timeout,
-            )
-        })
+    // First try a cheap probe against the existing JetStream context.
+    // This avoids reconnect churn on quiet-but-healthy streams.
+    if let Err(primary_error) = fetch_stream_state(jetstream, stream_name).await {
+        // If the in-place probe fails, run a full reconnect + stream lookup as
+        // a fallback check before surfacing a fatal error.
+        NatsReader::verify_server_and_stream_health(connection_config, stream_name)
+            .await
+            .map_err(|fallback_error| {
+                anyhow!(
+                    "NATS {context} stalled for {:?}. Existing connection health check failed: {primary_error:#}; reconnect health check failed: {fallback_error:#}",
+                    inactivity_timeout,
+                )
+            })?;
+    }
+
+    Ok(())
 }
 
 async fn consume_nats_messages_until(
+    jetstream: &jetstream::Context,
     nats_consumer: NatsConsumer,
     last_message_sequence: u64,
     connection_config: &cfg::ConnectOptions,
@@ -508,6 +520,7 @@ async fn consume_nats_messages_until(
             Ok(result) => result,
             Err(_) => {
                 check_inactivity_health(
+                    jetstream,
                     connection_config,
                     stream_name,
                     inactivity_timeout,
@@ -572,6 +585,7 @@ async fn consume_nats_messages_until(
 /// The ordered consumer ensures no gaps occur; if one is detected, it automatically
 /// recreates itself and resumes from the last known position.
 async fn spawn_nats_reader(
+    jetstream: jetstream::Context,
     nats_consumer: NatsConsumer,
     next_sequence: Arc<AtomicU64>,
     queue: Arc<InputQueue<u64>>,
@@ -622,6 +636,7 @@ async fn spawn_nats_reader(
                             }
                             Err(_) => {
                                 if let Err(error) = check_inactivity_health(
+                                    &jetstream,
                                     &connection_config,
                                     &stream_name,
                                     inactivity_timeout,
