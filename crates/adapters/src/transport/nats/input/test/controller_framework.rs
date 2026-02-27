@@ -39,6 +39,9 @@ pub(super) enum NatsControllerAction {
     /// Start the pipeline in a background thread and assert startup enters an
     /// error path (retrying non-fatal or fatal) within timeout.
     ExpectStartupRetrying,
+
+    /// Start the pipeline and assert startup fails fatally within timeout.
+    ExpectStartupFatal,
 }
 
 /// Internal state held by the Controller FT test runner.
@@ -436,6 +439,49 @@ outputs:
                 if result.is_err() {
                     eprintln!(
                         "FAIL: Expected a startup error within {timeout_ms}ms, but no error was reported."
+                    );
+                    std::process::abort();
+                }
+
+                controller.stop().unwrap();
+            }
+
+            NatsControllerAction::ExpectStartupFatal => {
+                assert!(
+                    self.controller.is_none(),
+                    "ExpectStartupFatal requires no running controller"
+                );
+
+                let got_fatal = Arc::new(AtomicBool::new(false));
+                let got_fatal_clone = got_fatal.clone();
+                let config = self.pipeline_config().clone();
+                let controller = Controller::with_test_config(
+                    |circuit_config| {
+                        Ok(test_circuit::<TestStruct>(
+                            circuit_config,
+                            &[],
+                            &[Some("output")],
+                        ))
+                    },
+                    &config,
+                    Box::new(move |e, _tag| {
+                        println!("Controller error: {e}");
+                        got_fatal_clone.store(true, Ordering::Release);
+                    }),
+                )
+                .unwrap();
+                controller.start();
+
+                let timeout_ms = self
+                    .inactivity_timeout_secs
+                    .map(|s| (s as u128 + 15) * 1000)
+                    .unwrap_or(30_000);
+
+                let result = wait(|| got_fatal.load(Ordering::Acquire), timeout_ms);
+
+                if result.is_err() {
+                    eprintln!(
+                        "FAIL: Expected a fatal startup error within {timeout_ms}ms, but none was reported."
                     );
                     std::process::abort();
                 }

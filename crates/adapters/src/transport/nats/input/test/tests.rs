@@ -830,7 +830,7 @@ fn test_nats_ft_replay_after_stream_purge() -> AnyResult<()> {
                 checkpoint: false,
             },
             PurgeStream,
-            ExpectStartupRetrying,
+            ExpectStartupFatal,
         ],
     )
 }
@@ -888,8 +888,8 @@ fn test_nats_ft_stream_deletion_and_recreation() -> AnyResult<()> {
             DeleteStream,
             CreateStream,
             // Restart: FT framework tries to replay uncommitted sequences,
-            // but they don't exist in the fresh stream -> startup error/retry.
-            ExpectStartupRetrying,
+            // but they don't exist in the fresh stream -> fatal startup error.
+            ExpectStartupFatal,
         ],
     )
 }
@@ -914,7 +914,22 @@ fn test_nats_ft_stream_deletion_after_full_checkpoint() -> AnyResult<()> {
             // so nothing needs replaying.
             DeleteStream,
             CreateStream,
-            // Resume metadata points at old stream sequence space; startup errors/retries.
+            // Resume metadata points at old stream sequence space; startup fails fatally.
+            ExpectStartupFatal,
+        ],
+    )
+}
+
+/// Startup should enter retrying error mode when the server is up but the
+/// configured stream has not been created yet.
+#[test]
+fn test_nats_ft_startup_retries_when_stream_missing() -> AnyResult<()> {
+    use NatsControllerAction::*;
+    run_nats_controller_test(
+        NatsControllerRunner::new()?.with_inactivity_timeout_secs(1),
+        &[
+            StartNats,
+            // Intentionally skip CreateStream to force startup retry mode.
             ExpectStartupRetrying,
         ],
     )
