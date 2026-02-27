@@ -70,11 +70,13 @@ pub(super) enum NatsMockAction {
     /// Purge all messages from the JetStream stream.
     PurgeStream,
 
-    /// Assert that a fatal error appears within `timeout`. Also polls
-    /// `endpoint.queue(false)` each iteration (matching original tests).
-    ExpectFatalError { timeout: Duration },
     /// Assert that a fatal error appears within [min, max] time window.
     ExpectFatalErrorWithin { min: Duration, max: Duration },
+    /// Assert that a fatal error appears within `timeout` and includes `needle`.
+    ExpectFatalErrorContains {
+        timeout: Duration,
+        needle: &'static str,
+    },
 
     /// Verify that `count` output records starting at `output_index` match
     /// the corresponding published records. The NATS sequence is derived
@@ -372,26 +374,6 @@ impl NatsMockRunner {
                     .block_on(util::purge_stream(&nats_url, STREAM_NAME))?;
             }
 
-            NatsMockAction::ExpectFatalError { timeout } => {
-                let timeout_ms = timeout.as_millis();
-                let endpoint = self.endpoint();
-                let mock_input_consumer = self.mock_input_consumer();
-                wait(
-                    || {
-                        endpoint.queue(false);
-                        mock_input_consumer.state().endpoint_error.is_some()
-                    },
-                    timeout_ms,
-                )
-                .map_err(|()| {
-                    anyhow::anyhow!("Timed out after {timeout_ms}ms waiting for fatal error")
-                })?;
-                assert!(
-                    self.got_fatal.load(Ordering::Acquire),
-                    "Error should be fatal"
-                );
-            }
-
             NatsMockAction::ExpectFatalErrorWithin { min, max } => {
                 let min_ms = min.as_millis();
                 let max_ms = max.as_millis();
@@ -420,6 +402,40 @@ impl NatsMockRunner {
                 assert!(
                     self.got_fatal.load(Ordering::Acquire),
                     "Error should be fatal"
+                );
+            }
+
+            NatsMockAction::ExpectFatalErrorContains { timeout, needle } => {
+                let timeout_ms = timeout.as_millis();
+                let endpoint = self.endpoint();
+                let mock_input_consumer = self.mock_input_consumer();
+                wait(
+                    || {
+                        endpoint.queue(false);
+                        mock_input_consumer.state().endpoint_error.is_some()
+                    },
+                    timeout_ms,
+                )
+                .map_err(|()| {
+                    anyhow::anyhow!("Timed out after {timeout_ms}ms waiting for fatal error")
+                })?;
+
+                let error_text = format!(
+                    "{:#}",
+                    mock_input_consumer
+                        .state()
+                        .endpoint_error
+                        .as_ref()
+                        .expect("fatal error should be present")
+                );
+
+                assert!(
+                    self.got_fatal.load(Ordering::Acquire),
+                    "Error should be fatal"
+                );
+                assert!(
+                    error_text.contains(needle),
+                    "Expected fatal error to contain '{needle}', got: {error_text}"
                 );
             }
 

@@ -45,8 +45,9 @@ fn test_nats_server_killed_mid_run_stalls() -> AnyResult<()> {
             WaitForRecords(1),
             AssertRecordCount(1),
             KillServer,
-            ExpectFatalError {
+            ExpectFatalErrorContains {
                 timeout: stall_timeout(),
+                needle: "NATS input stalled",
             },
             Disconnect,
         ],
@@ -69,17 +70,17 @@ fn test_nats_stream_deleted_mid_run_stalls() -> AnyResult<()> {
             WaitForRecords(1),
             AssertRecordCount(1),
             DeleteStream,
-            ExpectFatalError {
+            ExpectFatalErrorContains {
                 timeout: stall_timeout(),
+                needle: "NATS input stalled",
             },
             Disconnect,
         ],
     )
 }
 
-/// Tests that the connector reports a fatal error if replay stalls and the
-/// stream is deleted before the replay can complete. We simulate a running replay loop
-/// by not having any messages in stream.
+/// Tests that replay reports a fatal stall error when the stream is deleted
+/// while a large replay is in progress.
 #[test]
 fn test_nats_replay_stream_deleted_stalls() -> AnyResult<()> {
     use NatsMockAction::*;
@@ -88,21 +89,25 @@ fn test_nats_replay_stream_deleted_stalls() -> AnyResult<()> {
         &[
             StartNats,
             CreateStream,
+            Publish(50_000),
             CreatePipeline,
-            Replay { start: 1, end: 2 },
-            Sleep(Duration::from_millis(100)),
+            Replay {
+                start: 1,
+                end: 50_001,
+            },
+            WaitForReplayedRecords(100),
             DeleteStream,
-            ExpectFatalError {
+            ExpectFatalErrorContains {
                 timeout: stall_timeout(),
+                needle: "NATS replay stalled",
             },
             Disconnect,
         ],
     )
 }
 
-/// Tests that the connector reports a fatal error if replay stalls and the
-/// NATS server dies before the replay can complete. We simulate a running replay loop
-/// by not having any messages in stream.
+/// Tests that replay reports a fatal stall error when the NATS server dies
+/// while a large replay is in progress.
 #[test]
 fn test_nats_replay_server_killed_stalls() -> AnyResult<()> {
     use NatsMockAction::*;
@@ -111,12 +116,17 @@ fn test_nats_replay_server_killed_stalls() -> AnyResult<()> {
         &[
             StartNats,
             CreateStream,
+            Publish(50_000),
             CreatePipeline,
-            Replay { start: 1, end: 2 },
-            Sleep(Duration::from_millis(100)),
+            Replay {
+                start: 1,
+                end: 50_001,
+            },
+            WaitForReplayedRecords(100),
             KillServer,
-            ExpectFatalError {
+            ExpectFatalErrorContains {
                 timeout: stall_timeout(),
+                needle: "NATS replay stalled",
             },
             Disconnect,
         ],
@@ -363,8 +373,9 @@ fn test_nats_replay_after_purge_errors() -> AnyResult<()> {
             // Second pipeline: attempt to replay sequences [1, 6) — should fail.
             CreatePipeline,
             Replay { start: 1, end: 6 },
-            ExpectFatalError {
+            ExpectFatalErrorContains {
                 timeout: stall_timeout(),
+                needle: "Replay requested sequences",
             },
             Disconnect,
         ],

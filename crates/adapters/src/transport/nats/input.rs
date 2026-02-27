@@ -67,7 +67,7 @@ use tokio::{
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{Instrument, error, info, info_span};
+use tracing::{Instrument, debug, error, info, info_span};
 use xxhash_rust::xxh3::Xxh3Default;
 
 type NatsConsumerConfig = nats_consumer::pull::OrderedConfig;
@@ -78,9 +78,9 @@ type NatsConsumer = nats_consumer::Consumer<NatsConsumerConfig>;
 /// The sequence_numbers is a range `[start, end)` where:
 /// - `start` = first message sequence in batch
 /// - `end - 1` = last message in batch
-/// - `end` = next message to consume (exclusive)
+/// - `end` = resume cursor (next message to consume, exclusive)
 ///
-/// - `[0, 0)`: No messages processed and no checkpoint yet, start from beginning
+/// - `[0, 0)`: No checkpoint yet; resume cursor is uninitialized, start from beginning
 /// - `[6, 6)`: (empty) All messages up to #6 processed, resume from #6
 /// - `[6, 10)`: Batch contained messages #6-9, resume from #10
 #[derive(Debug, Serialize, Deserialize)]
@@ -90,7 +90,7 @@ struct Metadata {
 
 impl Metadata {
     fn from_resume_info(resume_info: Option<JsonValue>) -> Result<Self, AnyError> {
-        // If None JsonValue create Metadata value 0..0, meaning "start from beginning"
+        // `0..0` means an uninitialized resume cursor (fresh start).
         Ok(resume_info
             .map(serde_json::from_value)
             .transpose()?
@@ -189,9 +189,7 @@ impl NatsReader {
                         Ok::<_, AnyError>((client, js))
                     })
                     .await
-                    .map_err(|_| {
-                        anyhow!("NATS initialization timed out after {init_deadline:?}")
-                    })?
+                    .map_err(|_| anyhow!("NATS initialization timed out after {init_deadline:?}"))?
                 }
                 .instrument(span.clone()),
             )
@@ -300,14 +298,14 @@ impl NatsReader {
     ) -> Result<(), AnyError> {
         let mut canceller: Option<Canceller> = None;
         let queue = Arc::new(InputQueue::<u64>::new(consumer.clone()));
-        let next_sequence = Arc::new(AtomicU64::new(resume_info.sequence_numbers.end));
+        let resume_cursor = Arc::new(AtomicU64::new(resume_info.sequence_numbers.end));
         let nats_consumer_config = translate_consumer_options(&config.consumer_config);
         let inactivity_timeout = Duration::from_secs(config.inactivity_timeout_secs);
 
         validate_resume_position(
             &jetstream,
             &config.stream_name,
-            next_sequence.load(Ordering::Acquire),
+            resume_cursor.load(Ordering::Acquire),
         )
         .await?;
 
@@ -347,7 +345,7 @@ impl NatsReader {
 
                 consumer.replayed(buffer_size, hasher.finish());
 
-                next_sequence.store(last_message_sequence + 1, Ordering::Release);
+                resume_cursor.store(last_message_sequence + 1, Ordering::Release);
             } else {
                 consumer.replayed(BufferSize::default(), Xxh3Default::new().finish());
             }
@@ -365,14 +363,18 @@ impl NatsReader {
                         (Some((_, first)), Some((_, last))) => *first..*last + 1,
                         _ => {
                             // If no batches were queued, create an empty range [pos, pos).
-                            let pos = next_sequence.load(Ordering::Acquire);
+                            let pos = resume_cursor.load(Ordering::Acquire);
                             pos..pos
                         }
                     };
-                    info!(
-                        "Queued {:?} records ({sequence_number_range:?})",
-                        buffer_size
-                    );
+                    if buffer_size.records > 0 {
+                        info!(
+                            "Queued {:?} records ({sequence_number_range:?})",
+                            buffer_size
+                        );
+                    } else {
+                        debug!("Queued 0 records ({sequence_number_range:?})");
+                    }
                     let metadata_json = serde_json::to_value(&Metadata {
                         sequence_numbers: sequence_number_range,
                     })?;
@@ -396,13 +398,13 @@ impl NatsReader {
                     }
                 }
                 InputReaderCommand::Extend => {
-                    info!("Extend from {:?}", next_sequence.load(Ordering::Acquire));
+                    info!("Extend from {:?}", resume_cursor.load(Ordering::Acquire));
                     if canceller.is_none() {
                         let nats_consumer = create_nats_consumer(
                             &jetstream,
                             &nats_consumer_config,
                             &config.stream_name,
-                            next_sequence.load(Ordering::Acquire),
+                            resume_cursor.load(Ordering::Acquire),
                         )
                         .await?;
 
@@ -410,7 +412,7 @@ impl NatsReader {
                             spawn_nats_reader(
                                 jetstream.clone(),
                                 nats_consumer,
-                                next_sequence.clone(),
+                                resume_cursor.clone(),
                                 queue.clone(),
                                 config.connection_config.clone(),
                                 config.stream_name.clone(),
@@ -558,7 +560,7 @@ async fn consume_nats_messages_until(
                 };
                 consumer.buffered(amt);
                 buffer_size += amt;
-                info!("Got message #{}", info.stream_sequence);
+                debug!("Replay got message #{}", info.stream_sequence);
 
                 match info.stream_sequence.cmp(&last_message_sequence) {
                     cmp::Ordering::Less => (),     // Still more messages to consume
@@ -587,7 +589,7 @@ async fn consume_nats_messages_until(
 async fn spawn_nats_reader(
     jetstream: jetstream::Context,
     nats_consumer: NatsConsumer,
-    next_sequence: Arc<AtomicU64>,
+    resume_cursor: Arc<AtomicU64>,
     queue: Arc<InputQueue<u64>>,
     connection_config: cfg::ConnectOptions,
     stream_name: String,
@@ -623,9 +625,8 @@ async fn spawn_nats_reader(
                                             }
                                         };
                                         info!("Got message #{}", info.stream_sequence);
-                                        // Store the *next* sequence to process for resume tracking.
-                                        // This is the checkpoint position if we need to restart.
-                                        next_sequence.store(info.stream_sequence + 1, Ordering::Release);
+                                        // Store the checkpoint resume cursor (the next sequence).
+                                        resume_cursor.store(info.stream_sequence + 1, Ordering::Release);
                                         let data = &message.payload;
                                         queue.push_with_aux(parser.parse(data, None), Utc::now(), info.stream_sequence);
                                     }
@@ -690,71 +691,103 @@ async fn validate_replay_range(
     stream_name: &str,
     requested_range: &std::ops::Range<u64>,
 ) -> AnyResult<()> {
-    if requested_range.is_empty() {
-        return Ok(());
-    }
-
-    let stream_state = fetch_stream_state(jetstream, stream_name).await?;
-
-    if stream_state.messages == 0 {
-        return Err(anyhow!(
-            "Replay requested sequences {:?} from stream '{stream_name}', but the stream is empty",
-            requested_range
-        ));
-    }
-
-    let requested_first = requested_range.start;
-    let requested_last = requested_range.end - 1;
-    let available_first = stream_state.first_sequence;
-    let available_last = stream_state.last_sequence;
-
-    if requested_first < available_first || requested_first > available_last {
-        return Err(anyhow!(
-            "Replay start sequence {requested_first} is outside available stream range [{available_first}, {available_last}] for stream '{stream_name}'"
-        ));
-    }
-
-    if requested_last > available_last {
-        return Err(anyhow!(
-            "Replay end sequence {requested_last} exceeds available stream tail {available_last} for stream '{stream_name}'"
-        ));
-    }
-
-    Ok(())
+    validate_sequence_bounds(
+        jetstream,
+        stream_name,
+        SequenceValidationMode::Replay {
+            requested_range: requested_range.clone(),
+        },
+    )
+    .await
 }
 
 async fn validate_resume_position(
     jetstream: &jetstream::Context,
     stream_name: &str,
-    next_sequence: u64,
+    resume_cursor: u64,
 ) -> AnyResult<()> {
-    // Fresh starts use `0` and should always be allowed.
-    if next_sequence == 0 {
-        return Ok(());
+    validate_sequence_bounds(
+        jetstream,
+        stream_name,
+        SequenceValidationMode::Resume { resume_cursor },
+    )
+    .await
+}
+
+enum SequenceValidationMode {
+    Replay {
+        requested_range: std::ops::Range<u64>,
+    },
+    Resume {
+        resume_cursor: u64,
+    },
+}
+
+async fn validate_sequence_bounds(
+    jetstream: &jetstream::Context,
+    stream_name: &str,
+    mode: SequenceValidationMode,
+) -> AnyResult<()> {
+    match &mode {
+        SequenceValidationMode::Replay { requested_range } if requested_range.is_empty() => {
+            return Ok(());
+        }
+        SequenceValidationMode::Resume { resume_cursor: 0 } => {
+            // Fresh starts use `0` and should always be allowed.
+            return Ok(());
+        }
+        _ => {}
     }
 
     let stream_state = fetch_stream_state(jetstream, stream_name).await?;
-
-    if stream_state.messages == 0 {
-        return Err(anyhow!(
-            "Resume sequence {next_sequence} is invalid for stream '{stream_name}': stream is empty"
-        ));
-    }
-
     let available_first = stream_state.first_sequence;
     let available_last = stream_state.last_sequence;
-    let valid_upper = available_last.saturating_add(1);
 
-    if next_sequence < available_first {
-        return Err(anyhow!(
-            "Resume sequence {next_sequence} is before earliest available sequence {available_first} for stream '{stream_name}'"
-        ));
-    }
+    match mode {
+        SequenceValidationMode::Replay { requested_range } => {
+            if stream_state.messages == 0 {
+                return Err(anyhow!(
+                    "Replay requested sequences {:?} from stream '{stream_name}', but the stream is empty",
+                    requested_range
+                ));
+            }
 
-    if next_sequence > valid_upper {
-        return Err(anyhow!(
-            "Resume sequence {next_sequence} is after valid upper bound {valid_upper} for stream '{stream_name}'"
-        ));
+            let requested_first = requested_range.start;
+            let requested_last = requested_range.end - 1;
+
+            if requested_first < available_first || requested_first > available_last {
+                return Err(anyhow!(
+                    "Replay start sequence {requested_first} is outside available stream range [{available_first}, {available_last}] for stream '{stream_name}'"
+                ));
+            }
+
+            if requested_last > available_last {
+                return Err(anyhow!(
+                    "Replay end sequence {requested_last} exceeds available stream tail {available_last} for stream '{stream_name}'"
+                ));
+            }
+        }
+        SequenceValidationMode::Resume { resume_cursor } => {
+            if stream_state.messages == 0 {
+                return Err(anyhow!(
+                    "Resume sequence {resume_cursor} is invalid for stream '{stream_name}': stream is empty"
+                ));
+            }
+
+            let valid_upper = available_last.saturating_add(1);
+
+            if resume_cursor < available_first {
+                return Err(anyhow!(
+                    "Resume sequence {resume_cursor} is before earliest available sequence {available_first} for stream '{stream_name}'"
+                ));
+            }
+
+            if resume_cursor > valid_upper {
+                return Err(anyhow!(
+                    "Resume sequence {resume_cursor} is after valid upper bound {valid_upper} for stream '{stream_name}'"
+                ));
+            }
+        }
     }
 
     Ok(())
