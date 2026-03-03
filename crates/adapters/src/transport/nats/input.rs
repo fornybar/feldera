@@ -760,33 +760,8 @@ async fn spawn_nats_reader(
                     }
                     result = tokio::time::timeout(inactivity_timeout, nats_messages.next()) => {
                         match result {
-                            Ok(result) => {
-                                let Some(result) = result else {
-                                    let _ = reader_error_sender.send(anyhow!("Unexpected end of NATS stream"));
-                                    return;
-                                };
-                                match result {
-                                    Ok(message) => {
-                                        let info = match message.info() {
-                                            Ok(info) => info,
-                                            Err(error) => {
-                                                consumer.error(false, anyhow!("Failed to get NATS message info: {error}"), Some("nats-input"));
-                                                continue;
-                                            }
-                                        };
-                                        info!("Got message #{}", info.stream_sequence);
-                                        // Store the checkpoint resume cursor (the next sequence).
-                                        resume_cursor.store(info.stream_sequence + 1, Ordering::Release);
-                                        let data = &message.payload;
-                                        queue.push_with_aux(parser.parse(data, None), Utc::now(), info.stream_sequence);
-                                    }
-                                    Err(error) => {
-                                        let _ = reader_error_sender.send(anyhow!("NATS message stream error: {error}"));
-                                        return;
-                                    }
-                                }
-                            }
-                            Err(_) => {
+                            // Outer timeout fired while waiting for the next stream item.
+                            Err(_timeout_elapsed) => {
                                 if let Err(error) = check_inactivity_health(
                                     &jetstream,
                                     &connection_config,
@@ -797,6 +772,28 @@ async fn spawn_nats_reader(
                                     let _ = reader_error_sender.send(error);
                                     return;
                                 }
+                            }
+                            Ok(None) => {
+                                let _ = reader_error_sender.send(anyhow!("Unexpected end of NATS stream"));
+                                return;
+                            }
+                            Ok(Some(Err(error))) => {
+                                let _ = reader_error_sender.send(anyhow!("NATS message stream error: {error}"));
+                                return;
+                            }
+                            Ok(Some(Ok(message))) => {
+                                let info = match message.info() {
+                                    Ok(info) => info,
+                                    Err(error) => {
+                                        consumer.error(false, anyhow!("Failed to get NATS message info: {error}"), Some("nats-input"));
+                                        continue;
+                                    }
+                                };
+                                info!("Got message #{}", info.stream_sequence);
+                                // Store the checkpoint resume cursor (the next sequence).
+                                resume_cursor.store(info.stream_sequence + 1, Ordering::Release);
+                                let data = &message.payload;
+                                queue.push_with_aux(parser.parse(data, None), Utc::now(), info.stream_sequence);
                             }
                         }
                     }
