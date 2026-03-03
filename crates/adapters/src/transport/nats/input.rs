@@ -81,9 +81,18 @@ enum ReaderLifecycleState {
     Stopped,
 }
 
-enum StartReaderError {
+enum ConnectorError {
     Retryable(AnyError),
     Fatal(AnyError),
+}
+
+impl ConnectorError {
+    fn with_context(self, context: impl std::fmt::Display + Send + Sync + 'static) -> Self {
+        match self {
+            Self::Retryable(error) => Self::Retryable(error.context(context)),
+            Self::Fatal(error) => Self::Fatal(error.context(context)),
+        }
+    }
 }
 
 /// Checkpoint/resume metadata
@@ -283,8 +292,8 @@ impl NatsReader {
         consumer: Box<dyn InputConsumer>,
         parser: Box<dyn Parser>,
         inactivity_timeout: Duration,
-        reader_error_sender: UnboundedSender<AnyError>,
-    ) -> Result<Canceller, StartReaderError> {
+        reader_error_sender: UnboundedSender<ConnectorError>,
+    ) -> Result<Canceller, ConnectorError> {
         let jetstream = Self::initialize_jetstream(&config.connection_config, &config.stream_name)
             .await
             .with_context(|| {
@@ -297,7 +306,7 @@ impl NatsReader {
                     config.connection_config.request_timeout_secs,
                 )
             })
-            .map_err(StartReaderError::Retryable)?;
+            .map_err(ConnectorError::Retryable)?;
 
         validate_resume_position(
             &jetstream,
@@ -305,7 +314,7 @@ impl NatsReader {
             resume_cursor.load(Ordering::Acquire),
         )
         .await
-        .map_err(StartReaderError::Fatal)?;
+        .map_err(ConnectorError::Fatal)?;
 
         let nats_consumer = create_nats_consumer(
             &jetstream,
@@ -314,7 +323,7 @@ impl NatsReader {
             resume_cursor.load(Ordering::Acquire),
         )
         .await
-        .map_err(StartReaderError::Retryable)?;
+        .map_err(ConnectorError::Retryable)?;
 
         spawn_nats_reader(
             jetstream,
@@ -329,7 +338,7 @@ impl NatsReader {
             reader_error_sender,
         )
         .await
-        .map_err(StartReaderError::Retryable)
+        .map_err(ConnectorError::Retryable)
     }
 
     async fn worker_task(
@@ -342,7 +351,8 @@ impl NatsReader {
         let mut state = ReaderLifecycleState::Paused;
         let mut canceller: Option<Canceller> = None;
         let mut next_retry_at: Option<tokio::time::Instant> = None;
-        let (reader_error_sender, mut reader_error_receiver) = unbounded_channel::<AnyError>();
+        let (reader_error_sender, mut reader_error_receiver) =
+            unbounded_channel::<ConnectorError>();
         let queue = Arc::new(InputQueue::<u64>::new(consumer.clone()));
         let resume_cursor = Arc::new(AtomicU64::new(resume_info.sequence_numbers.end));
         let nats_consumer_config = translate_consumer_options(&config.consumer_config);
@@ -354,50 +364,81 @@ impl NatsReader {
         // Handle replay commands
         while let Some((metadata, ())) = command_receiver.recv_replay().await? {
             info!("Attempt to replay: {:?}", metadata);
-            if !metadata.sequence_numbers.is_empty() {
-                let jetstream = Self::initialize_jetstream(&config.connection_config, &config.stream_name)
+            let replay_result: Result<Option<u64>, ConnectorError> = async {
+                if !metadata.sequence_numbers.is_empty() {
+                    let jetstream = Self::initialize_jetstream(&config.connection_config, &config.stream_name)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "NATS replay initialization failed for stream '{}' at server '{}'",
+                                config.stream_name,
+                                config.connection_config.server_url,
+                            )
+                        })
+                        .map_err(ConnectorError::Fatal)?;
+
+                    validate_replay_range(&jetstream, &config.stream_name, &metadata.sequence_numbers)
+                        .await
+                        .map_err(ConnectorError::Fatal)?;
+
+                    let first_message_sequence = metadata.sequence_numbers.start;
+
+                    let nats_consumer = create_nats_consumer(
+                        &jetstream,
+                        &nats_consumer_config,
+                        &config.stream_name,
+                        first_message_sequence,
+                    )
+                    .await
+                    .map_err(ConnectorError::Fatal)?;
+
+                    // Since range is exclusive, last message to reply is (end-1).
+                    let last_message_sequence = metadata.sequence_numbers.end - 1;
+                    let (hasher, buffer_size) = consume_nats_messages_until(
+                        &jetstream,
+                        nats_consumer,
+                        last_message_sequence,
+                        &config.connection_config,
+                        &config.stream_name,
+                        inactivity_timeout,
+                        consumer.clone(),
+                        parser.fork(),
+                    )
                     .await
                     .with_context(|| {
                         format!(
-                            "NATS replay initialization failed for stream '{}' at server '{}'",
-                            config.stream_name,
-                            config.connection_config.server_url,
+                            "While attempting to replay sequences {first_message_sequence}..{last_message_sequence}"
                         )
-                    })?;
+                    })
+                    .map_err(ConnectorError::Fatal)?;
 
-                validate_replay_range(&jetstream, &config.stream_name, &metadata.sequence_numbers)
-                    .await?;
+                    consumer.replayed(buffer_size, hasher.finish());
 
-                let first_message_sequence = metadata.sequence_numbers.start;
+                    Ok(Some(last_message_sequence + 1))
+                } else {
+                    consumer.replayed(BufferSize::default(), Xxh3Default::new().finish());
+                    Ok(None)
+                }
+            }
+            .await;
 
-                let nats_consumer = create_nats_consumer(
-                    &jetstream,
-                    &nats_consumer_config,
-                    &config.stream_name,
-                    first_message_sequence,
-                )
-                .await?;
-
-                // Since range is exclusive, last message to reply is (end-1).
-                let last_message_sequence = metadata.sequence_numbers.end - 1;
-                let (hasher, buffer_size) = consume_nats_messages_until(
-                    &jetstream,
-                    nats_consumer,
-                    last_message_sequence,
-                    &config.connection_config,
-                    &config.stream_name,
-                    inactivity_timeout,
-                    consumer.clone(),
-                    parser.fork(),
-                )
-                .await
-                .with_context(|| format!("While attempting to replay sequences {first_message_sequence}..{last_message_sequence}"))?;
-
-                consumer.replayed(buffer_size, hasher.finish());
-
-                resume_cursor.store(last_message_sequence + 1, Ordering::Release);
-            } else {
-                consumer.replayed(BufferSize::default(), Xxh3Default::new().finish());
+            match replay_result {
+                Ok(Some(next_resume_cursor)) => {
+                    resume_cursor.store(next_resume_cursor, Ordering::Release);
+                }
+                Ok(None) => {}
+                Err(ConnectorError::Retryable(error)) => {
+                    consumer.error(
+                        false,
+                        anyhow!("NATS replay entered ERROR state: {error:#}"),
+                        Some("nats-input"),
+                    );
+                    return Ok(());
+                }
+                Err(ConnectorError::Fatal(error)) => {
+                    consumer.error(true, error, Some("nats-input"));
+                    return Ok(());
+                }
             }
         }
 
@@ -413,10 +454,18 @@ impl NatsReader {
                                 // Drain any additional errors queued before cancellation
                                 // to prevent stale errors from affecting the next reader.
                                 while reader_error_receiver.try_recv().is_ok() {}
-                                state = ReaderLifecycleState::ErrorRetrying;
-                                let error = error.context("NATS reader task failed");
-                                next_retry_at = Some(tokio::time::Instant::now() + retry_interval);
-                                consumer.error(false, anyhow!("NATS input entered ERROR state: {error:#}"), Some("nats-input"));
+                                match error.with_context("NATS reader task failed") {
+                                    ConnectorError::Retryable(error) => {
+                                        state = ReaderLifecycleState::ErrorRetrying;
+                                        next_retry_at = Some(tokio::time::Instant::now() + retry_interval);
+                                        consumer.error(false, anyhow!("NATS input entered ERROR state: {error:#}"), Some("nats-input"));
+                                    }
+                                    ConnectorError::Fatal(error) => {
+                                        state = ReaderLifecycleState::Stopped;
+                                        next_retry_at = None;
+                                        consumer.error(true, error, Some("nats-input"));
+                                    }
+                                }
                                 continue;
                             }
                             continue;
@@ -427,8 +476,17 @@ impl NatsReader {
                 ReaderLifecycleState::ErrorRetrying => {
                     select! {
                         maybe_error = reader_error_receiver.recv() => {
-                            if maybe_error.is_some() {
-                                next_retry_at = Some(tokio::time::Instant::now() + retry_interval);
+                            if let Some(error) = maybe_error {
+                                match error {
+                                    ConnectorError::Retryable(_) => {
+                                        next_retry_at = Some(tokio::time::Instant::now() + retry_interval);
+                                    }
+                                    ConnectorError::Fatal(error) => {
+                                        consumer.error(true, error, Some("nats-input"));
+                                        state = ReaderLifecycleState::Stopped;
+                                        next_retry_at = None;
+                                    }
+                                }
                             }
                             continue;
                         }
@@ -452,7 +510,7 @@ impl NatsReader {
                                     state = ReaderLifecycleState::Running;
                                     next_retry_at = None;
                                 }
-                                Err(StartReaderError::Retryable(error)) => {
+                                Err(ConnectorError::Retryable(error)) => {
                                     consumer.error(
                                         false,
                                         anyhow!("NATS input still in ERROR state, retrying in {:?}: {error:#}", retry_interval),
@@ -460,7 +518,7 @@ impl NatsReader {
                                     );
                                     next_retry_at = Some(tokio::time::Instant::now() + retry_interval);
                                 }
-                                Err(StartReaderError::Fatal(error)) => {
+                                Err(ConnectorError::Fatal(error)) => {
                                     consumer.error(
                                         true,
                                         anyhow!("NATS input encountered a non-retryable startup error: {error:#}"),
@@ -553,12 +611,12 @@ impl NatsReader {
                             canceller = Some(new_canceller);
                             next_retry_at = None;
                         }
-                        Err(StartReaderError::Retryable(error)) => {
+                        Err(ConnectorError::Retryable(error)) => {
                             state = ReaderLifecycleState::ErrorRetrying;
                             next_retry_at = Some(tokio::time::Instant::now() + retry_interval);
                             consumer.error(false, anyhow!("NATS input entered ERROR state: {error:#}"), Some("nats-input"));
                         }
-                        Err(StartReaderError::Fatal(error)) => {
+                        Err(ConnectorError::Fatal(error)) => {
                             consumer.error(
                                 true,
                                 anyhow!("NATS input encountered a non-retryable startup error: {error:#}"),
@@ -745,7 +803,7 @@ async fn spawn_nats_reader(
     inactivity_timeout: Duration,
     consumer: Box<dyn InputConsumer>,
     mut parser: Box<dyn Parser>,
-    reader_error_sender: UnboundedSender<AnyError>,
+    reader_error_sender: UnboundedSender<ConnectorError>,
 ) -> AnyResult<Canceller> {
     let mut nats_messages = nats_consumer.messages().await?;
 
@@ -769,16 +827,16 @@ async fn spawn_nats_reader(
                                     inactivity_timeout,
                                     "input",
                                 ).await {
-                                    let _ = reader_error_sender.send(error);
+                                    let _ = reader_error_sender.send(ConnectorError::Retryable(error));
                                     return;
                                 }
                             }
                             Ok(None) => {
-                                let _ = reader_error_sender.send(anyhow!("Unexpected end of NATS stream"));
+                                let _ = reader_error_sender.send(ConnectorError::Retryable(anyhow!("Unexpected end of NATS stream")));
                                 return;
                             }
                             Ok(Some(Err(error))) => {
-                                let _ = reader_error_sender.send(anyhow!("NATS message stream error: {error}"));
+                                let _ = reader_error_sender.send(ConnectorError::Retryable(anyhow!("NATS message stream error: {error}")));
                                 return;
                             }
                             Ok(Some(Ok(message))) => {
