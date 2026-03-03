@@ -735,84 +735,56 @@ fn test_nats_replay_multiple_ranges() -> AnyResult<()> {
 // Replay Failure Modes
 // ---------------------------------------------------------------------------
 
-/// Tests that replay reports a fatal stall error when the stream is deleted
-/// while a large replay is in progress.
+/// Replay should treat transient stream unavailability as retryable (non-fatal)
+/// and keep retrying until the stream is recreated with replayable data.
 #[test]
-fn test_nats_replay_stream_deleted_stalls() -> AnyResult<()> {
+fn test_nats_replay_stream_deleted_retries_and_recovers() -> AnyResult<()> {
     use NatsMockAction::*;
     run_nats_mock_test(
         nats_stall_config,
         &[
             StartNats,
             CreateStream,
-            Publish(50_000),
+            Publish(5_000),
             CreatePipeline,
             Replay {
                 start: 1,
-                end: 50_001,
+                end: 5_001,
             },
             WaitForReplayedRecords(100),
             DeleteStream,
-            ExpectFatalErrorContains {
+            WaitForErrorCountAtLeast {
+                count: 1,
                 timeout: stall_timeout(),
-                needle: "NATS replay stalled",
             },
-            Disconnect,
+            CreateStream,
+            Publish(5_000),
+            WaitForReplayedRecordsNoFatal(200),
+            DisconnectAllowNonFatal,
         ],
     )
 }
 
-/// Tests that replay reports a fatal stall error when the NATS server dies
-/// while a large replay is in progress.
+/// Replay should keep retrying with non-fatal errors while the server is down.
 #[test]
-fn test_nats_replay_server_killed_stalls() -> AnyResult<()> {
+fn test_nats_replay_server_killed_retries_non_fatal() -> AnyResult<()> {
     use NatsMockAction::*;
     run_nats_mock_test(
         nats_stall_config,
         &[
             StartNats,
             CreateStream,
-            Publish(50_000),
+            Publish(5_000),
             CreatePipeline,
             Replay {
                 start: 1,
-                end: 50_001,
+                end: 5_001,
             },
             WaitForReplayedRecords(100),
             KillServer,
-            ExpectFatalErrorContains {
+            WaitForErrorCountAtLeast {
+                count: 1,
                 timeout: stall_timeout(),
-                needle: "NATS replay stalled",
-            },
-            Disconnect,
-        ],
-    )
-}
-
-/// Replay fatal errors should terminate the worker path and must not enter the
-/// periodic non-fatal retry loop used by live reader recovery.
-#[test]
-fn test_nats_replay_fatal_error_does_not_retry_loop() -> AnyResult<()> {
-    use NatsMockAction::*;
-    run_nats_mock_test(
-        nats_stall_config,
-        &[
-            StartNats,
-            CreateStream,
-            Publish(50_000),
-            CreatePipeline,
-            Replay {
-                start: 1,
-                end: 50_001,
-            },
-            WaitForReplayedRecords(100),
-            DeleteStream,
-            ExpectFatalErrorContains {
-                timeout: stall_timeout(),
-                needle: "NATS replay stalled",
-            },
-            AssertNoErrorCountIncrease {
-                duration: Duration::from_secs(4),
             },
             DisconnectAllowNonFatal,
         ],

@@ -69,6 +69,9 @@ pub(super) enum NatsMockAction {
     /// Unlike `WaitForRecords`, this does NOT call `endpoint.queue()` —
     /// replay flushes records directly via `buffer.flush()`.
     WaitForReplayedRecords(usize),
+    /// Like `WaitForReplayedRecords`, but tolerates non-fatal endpoint errors
+    /// while still asserting that no fatal error occurred.
+    WaitForReplayedRecordsNoFatal(usize),
     /// Purge all messages from the JetStream stream.
     PurgeStream,
 
@@ -401,6 +404,31 @@ impl NatsMockRunner {
                     mock_input_consumer.state().endpoint_error.is_none(),
                     "Unexpected endpoint error while waiting for replayed records: {:?}",
                     mock_input_consumer.state().endpoint_error
+                );
+            }
+
+            NatsMockAction::WaitForReplayedRecordsNoFatal(n) => {
+                let n = *n;
+                let zset = self.zset();
+                wait(
+                    || {
+                        if self.got_fatal.load(Ordering::Acquire) {
+                            return true;
+                        }
+                        zset.state().flushed.len() >= n
+                    },
+                    DEFAULT_TIMEOUT_MS,
+                )
+                .map_err(|()| {
+                    anyhow::anyhow!(
+                        "Timed out waiting for {n} replayed records without fatal error (got {})",
+                        zset.state().flushed.len()
+                    )
+                })?;
+                assert!(
+                    !self.got_fatal.load(Ordering::Acquire),
+                    "Unexpected fatal endpoint error while waiting for replayed records: {:?}",
+                    self.mock_input_consumer().state().endpoint_error
                 );
             }
 

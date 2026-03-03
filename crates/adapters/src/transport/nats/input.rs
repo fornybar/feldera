@@ -364,8 +364,17 @@ impl NatsReader {
         // Handle replay commands
         while let Some((metadata, ())) = command_receiver.recv_replay().await? {
             info!("Attempt to replay: {:?}", metadata);
-            let replay_result: Result<Option<u64>, ConnectorError> = async {
-                if !metadata.sequence_numbers.is_empty() {
+            if metadata.sequence_numbers.is_empty() {
+                consumer.replayed(BufferSize::default(), Xxh3Default::new().finish());
+                continue;
+            }
+
+            let first_message_sequence = metadata.sequence_numbers.start;
+            // Since range is exclusive, last message to replay is (end - 1).
+            let last_message_sequence = metadata.sequence_numbers.end - 1;
+
+            'replay_attempt: loop {
+                let replay_result: Result<(Xxh3Default, BufferSize), ConnectorError> = async {
                     let jetstream = Self::initialize_jetstream(&config.connection_config, &config.stream_name)
                         .await
                         .with_context(|| {
@@ -375,13 +384,11 @@ impl NatsReader {
                                 config.connection_config.server_url,
                             )
                         })
-                        .map_err(ConnectorError::Fatal)?;
+                        .map_err(ConnectorError::Retryable)?;
 
                     validate_replay_range(&jetstream, &config.stream_name, &metadata.sequence_numbers)
                         .await
                         .map_err(ConnectorError::Fatal)?;
-
-                    let first_message_sequence = metadata.sequence_numbers.start;
 
                     let nats_consumer = create_nats_consumer(
                         &jetstream,
@@ -390,11 +397,9 @@ impl NatsReader {
                         first_message_sequence,
                     )
                     .await
-                    .map_err(ConnectorError::Fatal)?;
+                    .map_err(ConnectorError::Retryable)?;
 
-                    // Since range is exclusive, last message to reply is (end-1).
-                    let last_message_sequence = metadata.sequence_numbers.end - 1;
-                    let (hasher, buffer_size) = consume_nats_messages_until(
+                    consume_nats_messages_until(
                         &jetstream,
                         nats_consumer,
                         last_message_sequence,
@@ -405,39 +410,52 @@ impl NatsReader {
                         parser.fork(),
                     )
                     .await
-                    .with_context(|| {
-                        format!(
+                    .map_err(|error| {
+                        error.with_context(format!(
                             "While attempting to replay sequences {first_message_sequence}..{last_message_sequence}"
-                        )
+                        ))
                     })
-                    .map_err(ConnectorError::Fatal)?;
-
-                    consumer.replayed(buffer_size, hasher.finish());
-
-                    Ok(Some(last_message_sequence + 1))
-                } else {
-                    consumer.replayed(BufferSize::default(), Xxh3Default::new().finish());
-                    Ok(None)
                 }
-            }
-            .await;
+                .await;
 
-            match replay_result {
-                Ok(Some(next_resume_cursor)) => {
-                    resume_cursor.store(next_resume_cursor, Ordering::Release);
-                }
-                Ok(None) => {}
-                Err(ConnectorError::Retryable(error)) => {
-                    consumer.error(
-                        false,
-                        anyhow!("NATS replay entered ERROR state: {error:#}"),
-                        Some("nats-input"),
-                    );
-                    return Ok(());
-                }
-                Err(ConnectorError::Fatal(error)) => {
-                    consumer.error(true, error, Some("nats-input"));
-                    return Ok(());
+                match replay_result {
+                    Ok((hasher, buffer_size)) => {
+                        consumer.replayed(buffer_size, hasher.finish());
+                        resume_cursor.store(last_message_sequence + 1, Ordering::Release);
+                        break;
+                    }
+                    Err(ConnectorError::Retryable(error)) => {
+                        consumer.error(
+                            false,
+                            anyhow!(
+                                "NATS replay entered ERROR state, retrying in {:?}: {error:#}",
+                                retry_interval
+                            ),
+                            Some("nats-input"),
+                        );
+
+                        if let Some(command) = command_receiver.try_recv()? {
+                            match command {
+                                InputReaderCommand::Disconnect => return Ok(()),
+                                InputReaderCommand::Replay { .. } => {
+                                    // Keep this command buffered and continue retrying
+                                    // the current replay range until it completes.
+                                    command_receiver.put_back(command);
+                                }
+                                other => {
+                                    // Honor control commands while replay is retrying.
+                                    command_receiver.put_back(other);
+                                    break 'replay_attempt;
+                                }
+                            }
+                        }
+
+                        tokio::time::sleep(retry_interval).await;
+                    }
+                    Err(ConnectorError::Fatal(error)) => {
+                        consumer.error(true, error, Some("nats-input"));
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -717,8 +735,11 @@ async fn consume_nats_messages_until(
     inactivity_timeout: Duration,
     consumer: Box<dyn InputConsumer>,
     mut parser: Box<dyn Parser>,
-) -> AnyResult<(Xxh3Default, BufferSize)> {
-    let mut nats_messages = nats_consumer.messages().await?;
+) -> Result<(Xxh3Default, BufferSize), ConnectorError> {
+    let mut nats_messages = nats_consumer
+        .messages()
+        .await
+        .map_err(|error| ConnectorError::Retryable(error.into()))?;
 
     let mut hasher = Xxh3Default::new();
     let mut buffer_size = BufferSize::default();
@@ -734,14 +755,17 @@ async fn consume_nats_messages_until(
                     inactivity_timeout,
                     "replay",
                 )
-                .await?;
+                .await
+                .map_err(ConnectorError::Retryable)?;
                 continue;
             }
             Ok(None) => {
-                return Err(anyhow!("Unexpected end of NATS stream"));
+                return Err(ConnectorError::Retryable(anyhow!(
+                    "Unexpected end of NATS stream"
+                )));
             }
             Ok(Some(Err(error))) => {
-                consumer.error(false, anyhow!("NATS error: {error}"), Some("nats-input"));
+                return Err(ConnectorError::Retryable(anyhow!("NATS error: {error}")));
             }
             Ok(Some(Ok(message))) => {
                 let info = match message.info() {
@@ -774,10 +798,10 @@ async fn consume_nats_messages_until(
                     cmp::Ordering::Less => (),     // Still more messages to consume
                     cmp::Ordering::Equal => break, // This was the final message we wanted
                     cmp::Ordering::Greater => {
-                        return Err(anyhow!(
+                        return Err(ConnectorError::Fatal(anyhow!(
                             "Received unexpected message with offset {}; maybe the requested messages have been deleted?",
                             info.stream_sequence
-                        ));
+                        )));
                     }
                 }
             }
