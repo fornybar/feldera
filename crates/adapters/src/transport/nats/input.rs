@@ -666,9 +666,9 @@ async fn consume_nats_messages_until(
     let mut buffer_size = BufferSize::default();
     loop {
         let next_result = tokio::time::timeout(inactivity_timeout, nats_messages.next()).await;
-        let Some(result) = (match next_result {
-            Ok(result) => result,
-            Err(_) => {
+        match next_result {
+            // Outer timeout fired while waiting for the next stream item.
+            Err(_timeout_elapsed) => {
                 check_inactivity_health(
                     jetstream,
                     connection_config,
@@ -679,11 +679,13 @@ async fn consume_nats_messages_until(
                 .await?;
                 continue;
             }
-        }) else {
-            return Err(anyhow!("Unexpected end of NATS stream"));
-        };
-        match result {
-            Ok(message) => {
+            Ok(None) => {
+                return Err(anyhow!("Unexpected end of NATS stream"));
+            }
+            Ok(Some(Err(error))) => {
+                consumer.error(false, anyhow!("NATS error: {error}"), Some("nats-input"));
+            }
+            Ok(Some(Ok(message))) => {
                 let info = match message.info() {
                     Ok(info) => info,
                     Err(error) => {
@@ -721,7 +723,6 @@ async fn consume_nats_messages_until(
                     }
                 }
             }
-            Err(error) => consumer.error(false, anyhow!("NATS error: {error}"), Some("nats-input")),
         }
     }
 
