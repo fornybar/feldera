@@ -290,6 +290,50 @@ format:
     )
 }
 
+/// Startup retry loop should continue emitting non-fatal transport errors at
+/// retry cadence while the server remains unreachable.
+#[test]
+fn test_nats_startup_connection_refused_retries_repeatedly() -> AnyResult<()> {
+    use NatsMockAction::*;
+    let nonexistent_url = "nats://127.0.0.1:59999";
+    run_nats_mock_test(
+        |_: &str| {
+            format!(
+                r#"
+stream: test_input
+transport:
+    name: nats_input
+    config:
+        connection_config:
+            server_url: {nonexistent_url}
+            request_timeout_secs: 1
+        stream_name: {STREAM_NAME}
+        inactivity_timeout_secs: 1
+        retry_interval_secs: 1
+        consumer_config:
+            deliver_policy: All
+            subjects: [{SUBJECT_NAME}]
+format:
+    name: json
+    config:
+        update_format: raw
+"#
+            )
+        },
+        &[
+            StartNats,
+            CreatePipeline,
+            Extend,
+            WaitForErrorCountAtLeast {
+                count: 2,
+                timeout: Duration::from_secs(8),
+            },
+            Pause,
+            DisconnectAllowNonFatal,
+        ],
+    )
+}
+
 /// Test that missing stream enters retry loop instead of failing pipeline open.
 #[test]
 fn test_nats_stream_not_found_enters_retry_loop() -> AnyResult<()> {
@@ -741,6 +785,36 @@ fn test_nats_replay_server_killed_stalls() -> AnyResult<()> {
                 needle: "NATS replay stalled",
             },
             Disconnect,
+        ],
+    )
+}
+
+/// Replay fatal errors should terminate the worker path and must not enter the
+/// periodic non-fatal retry loop used by live reader recovery.
+#[test]
+fn test_nats_replay_fatal_error_does_not_retry_loop() -> AnyResult<()> {
+    use NatsMockAction::*;
+    run_nats_mock_test(
+        nats_stall_config,
+        &[
+            StartNats,
+            CreateStream,
+            Publish(50_000),
+            CreatePipeline,
+            Replay {
+                start: 1,
+                end: 50_001,
+            },
+            WaitForReplayedRecords(100),
+            DeleteStream,
+            ExpectFatalErrorContains {
+                timeout: stall_timeout(),
+                needle: "NATS replay stalled",
+            },
+            AssertNoErrorCountIncrease {
+                duration: Duration::from_secs(4),
+            },
+            DisconnectAllowNonFatal,
         ],
     )
 }
