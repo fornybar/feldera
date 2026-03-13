@@ -66,7 +66,6 @@ in {
     nodePackages.mermaid-cli # Render Mermaid diagrams (mmdc) for docs and reviews.
 
     prek # pre-comitt
-    cargo-machete # pre-comitt dependencies
     #llvmPackages.libclang # libclang needed by bindgen and builds (.devcontainer/Dockerfile#L40-L43).
 
     #    #curl # Used by build scripts and tooling ( .devcontainer/Dockerfile#L17-L36 ).
@@ -88,6 +87,15 @@ in {
     #        unzip # Required for tooling downloads ( .devcontainer/Dockerfile#L17-L36 ).
     #    #postgresql_15
   ]; # End packages.
+
+  enterShell = ''
+    machete_bin="$CARGO_INSTALL_ROOT/bin/cargo-machete"
+    if ! [ -x "$machete_bin" ]; then
+      cargo install --locked --root "$CARGO_INSTALL_ROOT" cargo-machete --version 0.7.0 --force
+    elif ! "$machete_bin" --version | grep -Eq '^(cargo-machete )?0\.7\.0$'; then
+      cargo install --locked --root "$CARGO_INSTALL_ROOT" cargo-machete --version 0.7.0 --force
+    fi
+  '';
 
   env = { # Environment variables to point builds to system toolchains.
     #    JAVA_HOME = "${pkgs.jdk21}"; # Ensure Java tooling resolves JDK 21 (README.md#L120, .devcontainer/Dockerfile#L40-L43).

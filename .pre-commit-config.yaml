@@ -26,7 +26,7 @@ repos:
         pass_filenames: false
       - id: cargo-machete
         name: Cargo Machete
-        entry: bash -c 'cd crates && cargo machete --fix'
+        entry: bash -c 'cd crates && "${CARGO_INSTALL_ROOT:+$CARGO_INSTALL_ROOT/bin/}cargo-machete" --fix'
         language: system
         files: \.rs$
         pass_filenames: false
