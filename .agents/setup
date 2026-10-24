@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+# Prepares an Amp orb (Debian 12) to build and test Feldera: system packages,
+# JDK 21, librdkafka, the pinned Rust toolchain, the SQL compiler with its
+# Calcite snapshot, and the Rust, JS, and Python dependencies. Runs once per
+# fresh orb and again on a stale snapshot, so every step must be idempotent and
+# cheap when its result is already present.
+set -euo pipefail
+
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$repo_root"
+export DEBIAN_FRONTEND=noninteractive
+
+step() {
+    local name=$1
+    shift
+    local start=$SECONDS
+    echo "==> $name"
+    "$@"
+    echo "<== $name ($((SECONDS - start))s)"
+}
+
+# Build dependencies from the README and .devcontainer/Dockerfile. Debian 12
+# ships only JDK 17, and the SQL compiler needs 19+, so JDK 21 comes from the
+# Adoptium repository. cmake and Go build AWS-LC for librdkafka; AWS-LC needs
+# Go 1.20+, which Debian 12 has only in bookworm-backports.
+apt_packages=(
+    build-essential clang libclang-dev cmake pkg-config
+    libssl-dev libsasl2-dev zlib1g-dev libzstd-dev protobuf-compiler
+    graphviz maven temurin-21-jdk
+)
+
+install_apt_packages() {
+    local missing=()
+    local pkg
+    for pkg in "${apt_packages[@]}"; do
+        dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "ok installed" || missing+=("$pkg")
+    done
+    local go_version
+    go_version=$(dpkg-query -W -f='${Version}' golang-go 2>/dev/null || true)
+    local need_go=false
+    if [ -z "$go_version" ] || dpkg --compare-versions "$go_version" lt 2:1.20; then
+        need_go=true
+    fi
+    if [ ${#missing[@]} -eq 0 ] && [ "$need_go" = false ]; then
+        echo "all apt packages present"
+        return
+    fi
+    if [ ! -f /etc/apt/sources.list.d/adoptium.list ]; then
+        sudo install -d -m 0755 /etc/apt/keyrings
+        curl -fsSL https://packages.adoptium.net/artifactory/api/gpg/key/public |
+            sudo gpg --batch --yes --dearmor -o /etc/apt/keyrings/adoptium.gpg
+        echo "deb [signed-by=/etc/apt/keyrings/adoptium.gpg] https://packages.adoptium.net/artifactory/deb bookworm main" |
+            sudo tee /etc/apt/sources.list.d/adoptium.list >/dev/null
+    fi
+    if [ ! -f /etc/apt/sources.list.d/bookworm-backports.list ]; then
+        echo "deb http://deb.debian.org/debian bookworm-backports main" |
+            sudo tee /etc/apt/sources.list.d/bookworm-backports.list >/dev/null
+    fi
+    sudo apt-get update -qq
+    if [ ${#missing[@]} -gt 0 ]; then
+        sudo apt-get install -y -qq --no-install-recommends "${missing[@]}"
+    fi
+    if [ "$need_go" = true ]; then
+        sudo apt-get install -y -qq --no-install-recommends -t bookworm-backports golang-go
+    fi
+}
+
+# rdkafka-sys links librdkafka dynamically, and the repository script builds the
+# version Cargo.lock names against AWS-LC. Rebuild only when that version changes.
+install_librdkafka() {
+    local want
+    want=$(grep -A1 'name = "rdkafka-sys"' Cargo.lock | grep '^version' | sed 's/.*+//; s/"//')
+    if [ "$(pkg-config --modversion rdkafka 2>/dev/null || true)" = "$want" ]; then
+        echo "librdkafka $want already installed"
+        return
+    fi
+    sudo PREFIX=/usr/local CARGO_LOCK="$repo_root/Cargo.lock" bash scripts/install-librdkafka.sh
+}
+
+# rustup reads the channel and components from rust-toolchain.toml. The orb's
+# ~/.bash_profile does not source ~/.profile, so cargo's PATH goes there.
+install_rust() {
+    if [ ! -x "$HOME/.cargo/bin/rustup" ]; then
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
+            sh -s -- -y --profile minimal --default-toolchain none --no-modify-path
+    fi
+    local marker="# feldera: cargo environment"
+    if ! grep -Fqx "$marker" "$HOME/.bash_profile" 2>/dev/null; then
+        printf '\n%s\n. "$HOME/.cargo/env"\n' "$marker" >>"$HOME/.bash_profile"
+    fi
+    # shellcheck disable=SC1091
+    . "$HOME/.cargo/env"
+    rustup toolchain install
+    rustc --version
+}
+
+fetch_rust_crates() {
+    cargo fetch --locked
+}
+
+# build.sh builds the pinned Calcite snapshot with Gradle, installs it into
+# ~/.m2, and packages the SQL compiler with Maven. That takes minutes, so it
+# reruns only when the Calcite pin or a pom changes.
+build_sql_compiler() {
+    local stamp_dir="$HOME/.cache/feldera-orb"
+    local stamp="$stamp_dir/sql-compiler.sha256"
+    local fingerprint
+    fingerprint=$(cat sql-to-dbsp-compiler/calcite_version.env sql-to-dbsp-compiler/pom.xml \
+        sql-to-dbsp-compiler/*/pom.xml | sha256sum | cut -d' ' -f1)
+    if [ -f "$stamp" ] && [ "$(cat "$stamp")" = "$fingerprint" ]; then
+        echo "SQL compiler dependencies unchanged"
+        return
+    fi
+    (cd sql-to-dbsp-compiler && ./build.sh)
+    # Gradle leaves a daemon behind; it would not survive into the snapshot.
+    (cd sql-to-dbsp-compiler/calcite-build && ./gradlew --stop -q) || true
+    mkdir -p "$stamp_dir"
+    echo "$fingerprint" >"$stamp"
+}
+
+install_js_dependencies() {
+    bun install --frozen-lockfile
+}
+
+install_python_dependencies() {
+    (cd python && uv sync --locked)
+}
+
+step "apt packages" install_apt_packages
+step "librdkafka" install_librdkafka
+step "rust toolchain" install_rust
+step "cargo fetch" fetch_rust_crates
+step "SQL compiler" build_sql_compiler
+step "bun install" install_js_dependencies
+step "python (uv sync)" install_python_dependencies
