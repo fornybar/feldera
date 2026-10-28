@@ -78,6 +78,8 @@ use tokio::sync::oneshot;
 use tracing::info;
 use uuid::Uuid;
 
+mod input_lifecycle;
+
 #[engine_test]
 pub fn start_after_cyclic(engine: &dyn PipelineTestEngine) {
     init_test_logger();

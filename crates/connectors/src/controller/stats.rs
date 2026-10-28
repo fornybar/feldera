@@ -1741,8 +1741,8 @@ impl ControllerStatus {
     /// entry.
     ///
     /// Returns an error if the new endpoint would have a duplicate name or if
-    /// `open()` returns an error.  In either case, the final state is that the
-    /// endpoint is not inserted.
+    /// `open()` returns an error. Shutdown also rejects installation, without
+    /// removing any checkpoint-visible status retained by teardown.
     pub fn insert_input_endpoint<F>(
         &self,
         endpoint_id: u64,
@@ -1758,6 +1758,9 @@ impl ControllerStatus {
         // `eoi` to the controller, the eoi status is recorded and not dropped
         // on the floor.
         let mut status = self.inputs.write();
+        if self.state() == PipelineState::Terminated {
+            return Err(ControllerError::ControllerExit);
+        }
         if status.values().any(|ep| ep.endpoint_name == endpoint_name) {
             return Err(ControllerError::duplicate_input_endpoint(endpoint_name));
         }
@@ -1766,11 +1769,22 @@ impl ControllerStatus {
 
         match open() {
             Ok(reader) => {
-                self.inputs.write().get_mut(&endpoint_id).unwrap().reader = Some(Arc::from(reader));
+                let mut status = self.inputs.write();
+                // Use the same lock as stop's disconnect sweep. An API-entry
+                // check alone allows a reader to appear after that sweep.
+                if self.state() == PipelineState::Terminated {
+                    drop(status);
+                    reader.disconnect();
+                    return Err(ControllerError::ControllerExit);
+                }
+                status.get_mut(&endpoint_id).unwrap().reader = Some(Arc::from(reader));
                 Ok(())
             }
             Err(e) => {
-                self.inputs.write().remove(&endpoint_id);
+                let mut status = self.inputs.write();
+                if self.state() != PipelineState::Terminated {
+                    status.remove(&endpoint_id);
+                }
                 Err(ControllerError::input_transport_error(
                     &endpoint_name,
                     true,

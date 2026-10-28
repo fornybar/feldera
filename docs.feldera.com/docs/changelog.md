@@ -10,6 +10,10 @@ Source edition can be found on github.
 
 ## Unreleased
 
+- Bug fix (input connectors): a connection opening during pipeline shutdown
+  could panic or escape shutdown. Stopping now waits for admitted opens and
+  rejects late connections before installing their readers.
+
 - Experimental (Enterprise, Kubernetes): a resize of `memory_max` with
   `PATCH /v0/pipelines/{name}` also changes the memory budget of the
   running pipeline, unless `max_rss` is set.  A smaller budget applies at

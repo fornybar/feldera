@@ -1618,7 +1618,13 @@ impl Controller {
         //
         // The completions run on TOKIO already, so wait with a plain executor:
         // `TOKIO.block_on` panics when the caller is itself inside a runtime.
-        let completions = mem::take(&mut *self.inner.input_completions.lock().unwrap());
+        let completions = {
+            // An open admitted before termination may still register a worker.
+            // Wait for installation or rejection before collecting completions,
+            // without holding the admission fence while cleanup calls back.
+            let _opens = self.inner.input_open_fence.write();
+            mem::take(&mut *self.inner.input_completions.lock().unwrap())
+        };
         futures::executor::block_on(async {
             for completion in completions {
                 let _ = completion.await;
@@ -7798,6 +7804,10 @@ pub struct ControllerInner {
     /// Worker completion, including readers removed before controller shutdown.
     input_completions: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 
+    /// Opens hold a shared guard through reader installation and completion
+    /// registration. Blocking stop fences them; initiate_stop never waits here.
+    input_open_fence: parking_lot::RwLock<()>,
+
     /// Runs after capturing the checkpoint's input snapshot.
     #[cfg(any(test, feature = "testing"))]
     checkpoint_snapshot_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
@@ -7930,6 +7940,7 @@ impl ControllerInner {
                 modified_output_endpoints,
                 bootstrapped_output_endpoints,
                 input_completions: Mutex::new(Vec::new()),
+                input_open_fence: parking_lot::RwLock::new(()),
                 #[cfg(any(test, feature = "testing"))]
                 checkpoint_snapshot_hook: Mutex::new(None),
                 #[cfg(any(test, feature = "testing"))]
@@ -8272,6 +8283,10 @@ impl ControllerInner {
         resume_info: Option<(JsonValue, CheckpointInputEndpointMetrics)>,
         distributed: Option<DistributedInput>,
     ) -> Result<EndpointId, ControllerError> {
+        let _opening = self.input_open_fence.read();
+        if self.shutdown_token().is_cancelled() {
+            return Err(ControllerError::ControllerExit);
+        }
         let (seek, initial_statistics) = resume_info.unzip();
 
         debug!("Adding input endpoint '{endpoint_name}'; config: {endpoint_config:?}");
