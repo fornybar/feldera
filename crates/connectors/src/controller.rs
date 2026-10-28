@@ -4016,6 +4016,29 @@ impl CircuitThread {
         if let Some(ft) = self.ft.as_mut() {
             ft.sync_step()?;
         }
+
+        // Keep each queued incarnation registered through journaling, not
+        // merely until extended arrives. Otherwise removal can discard its
+        // replay data, or a same-name replacement can supply the wrong config
+        // for this step's input. Disconnect outside the status lock.
+        let retired: Vec<_> = self
+            .controller
+            .status
+            .input_status()
+            .iter()
+            .filter_map(|(&id, status)| {
+                let queued = status.step_in_progress.swap(false, Ordering::Relaxed);
+                (queued && status.disconnect_requested).then_some(id)
+            })
+            .collect();
+        for endpoint_id in &retired {
+            self.controller.disconnect_input(endpoint_id);
+        }
+        if !retired.is_empty() {
+            // Record the removal in the next entry, after this step's input.
+            self.controller.request_step();
+        }
+
         // Push output batches to output pipelines.
         self.push_output(processed_records, &paused_outputs);
         let replay_consumed = self.replay_consumed;
@@ -4654,6 +4677,7 @@ impl CircuitThread {
                 selection.polls(status)
             };
             if polled {
+                status.step_in_progress.store(true, Ordering::Relaxed);
                 if !self.replaying() {
                     // `polls` only selects endpoints that have a reader.
                     let reader = status.reader.as_ref().unwrap();

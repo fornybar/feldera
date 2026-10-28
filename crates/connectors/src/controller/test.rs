@@ -82,6 +82,7 @@ mod checkpoint_admission;
 mod checkpoint_lifecycle;
 mod initial_resume;
 mod input_lifecycle;
+mod input_step;
 
 #[engine_test]
 pub fn start_after_cyclic(engine: &dyn PipelineTestEngine) {
@@ -1613,15 +1614,15 @@ pub fn api_transaction_started_during_commit_does_not_stall_it(engine: &dyn Pipe
     x_committed.expect("X's commit stalled after Y started");
 }
 
-/// A step must replay even if an ad hoc INSERT whose input it consumed removed
-/// its endpoint before the step was journaled.
+/// A step must replay even if an ad hoc INSERT whose input it consumed returned
+/// and requested removal of its endpoint before the step was journaled.
 ///
 /// The journal records, for each step, the input endpoints added and removed
 /// since the previous step and the input each endpoint supplied.  Replay adds
 /// and removes endpoints first, then feeds each endpoint its input, so a
 /// record that removes an endpoint, or never adds it, cannot also feed it.
 #[engine_test(requires(Storage, FaultTolerance))]
-pub fn adhoc_insert_removed_before_journaling_replays(engine: &dyn PipelineTestEngine) {
+pub fn adhoc_insert_returns_before_journaling_replays(engine: &dyn PipelineTestEngine) {
     init_test_logger();
 
     let tempdir = TempDir::new().unwrap();
@@ -1646,25 +1647,21 @@ pub fn adhoc_insert_removed_before_journaling_replays(engine: &dyn PipelineTestE
     wait(|| !controller.is_replaying(), 10_000).unwrap();
 
     // Hold the journal write of the step that consumes the INSERT until the
-    // INSERT has removed its endpoint.
+    // INSERT returns. Removal may now defer deletion until the step is safe;
+    // waiting for physical deletion here would deadlock that handshake.
     let held = Arc::new(AtomicBool::new(false));
+    let insert_returned = Arc::new(AtomicBool::new(false));
     *controller.inner.journal_step_hook.lock().unwrap() = Some(Box::new({
         let held = held.clone();
+        let insert_returned = insert_returned.clone();
         move |inner, names| {
-            if !names.iter().any(|name| is_adhoc(name)) {
+            if !names.iter().any(|name| is_adhoc(name))
+                || inner.status.num_total_circuit_input_records() == 0
+            {
                 return false;
             }
-            let removed = wait(
-                || {
-                    !inner
-                        .status
-                        .input_status()
-                        .values()
-                        .any(|status| is_adhoc(&status.endpoint_name))
-                },
-                10_000,
-            );
-            held.store(removed.is_ok(), Ordering::Release);
+            let returned = wait(|| insert_returned.load(Ordering::Acquire), 10_000);
+            held.store(returned.is_ok(), Ordering::Release);
             true
         }
     }));
@@ -1673,10 +1670,11 @@ pub fn adhoc_insert_removed_before_journaling_replays(engine: &dyn PipelineTestE
         "INSERT INTO test_input1 VALUES (1, true, 1, 'one')",
     )
     .unwrap();
+    insert_returned.store(true, Ordering::Release);
     // The INSERT returns once its step has taken its input, which is before
     // the step is journaled.
     wait(|| held.load(Ordering::Acquire), 10_000)
-        .expect("the INSERT did not remove its endpoint before its step was journaled");
+        .expect("the INSERT did not return before its step was journaled");
     controller.stop().unwrap();
 
     // Restart from the journal.
@@ -1700,9 +1698,8 @@ pub fn adhoc_insert_removed_before_journaling_replays(engine: &dyn PipelineTestE
     replayed.expect("replay never finished");
     assert!(errors.is_empty(), "replay failed: {errors:?}");
 
-    // No step ran after the INSERT's step, so the journal never recorded
-    // removing its endpoint.  Replay must remove it anyway, once it has fed
-    // the endpoint its input.
+    // If no step recorded retirement after the INSERT's step, replay must
+    // still remove the endpoint once it has fed the endpoint its input.
     assert_eq!(adhoc_input_endpoints(&controller), Vec::<String>::new());
     assert_eq!(count_rows(&controller, "test_input1"), 1);
     controller.stop().unwrap();

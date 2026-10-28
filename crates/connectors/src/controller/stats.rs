@@ -825,7 +825,17 @@ impl ControllerStatus {
         endpoint_id: &EndpointId,
         circuit_thread_unparker: &Unparker,
     ) -> Option<InputEndpointStatus> {
-        let endpoint = self.inputs.write().remove(endpoint_id)?;
+        let mut inputs = self.inputs.write();
+        let endpoint = inputs.get_mut(endpoint_id)?;
+        if endpoint.step_in_progress.load(Ordering::Relaxed) {
+            // Queue may have applied rows without reporting their replay
+            // metadata yet. Keep this incarnation until the circuit thread
+            // has collected and journaled the complete step.
+            endpoint.disconnect_requested = true;
+            return None;
+        }
+        let endpoint = inputs.remove(endpoint_id)?;
+        drop(inputs);
 
         // The endpoint may have handed records to the circuit that the circuit
         // thread has not counted yet. That result dies with the endpoint, so
@@ -2389,6 +2399,14 @@ pub struct InputEndpointStatus {
     /// Progress within the latest step.
     pub progress: Mutex<Option<StepResults>>,
 
+    /// Set before Queue, under the input-map read lock; cleared only after
+    /// the circuit has processed and journaled that step. Removal uses the
+    /// write lock so it cannot race with admission into a step.
+    pub(super) step_in_progress: AtomicBool,
+
+    /// Removal requested during a step, to complete after recording its input.
+    pub(super) disconnect_requested: bool,
+
     /// May be None during endpoint initialization.
     pub reader: Option<Arc<dyn InputReader>>,
 
@@ -2521,6 +2539,8 @@ impl InputEndpointStatus {
             preprocessor_watchdog,
             preprocessor_stall: Mutex::new(None),
             progress: Mutex::new(None),
+            step_in_progress: AtomicBool::new(false),
+            disconnect_requested: false,
             paused: AtomicBool::new(paused_by_user),
             barrier: AtomicBool::new(false),
             reader: None,

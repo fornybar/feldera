@@ -10,6 +10,10 @@ Source edition can be found on github.
 
 ## Unreleased
 
+- Bug fix (input connectors): removing an input during a step now retains it
+  until that step's input and replay metadata have been recorded. Previously,
+  a File input removed after applying rows could lose them on recovery.
+
 - Bug fix (checkpointing): newly added inputs report their initial resume
   position before entering a checkpoint, even while paused. This prevents an
   idle Kafka `latest` input from skipping data after restart and a replacement
