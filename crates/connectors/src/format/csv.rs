@@ -187,11 +187,15 @@ impl Parser for CsvParser {
 
     fn splitter(&self) -> Box<dyn super::Splitter> {
         Box::new(CsvSplitter::new(
-            self.headers,
+            self.headers && self.last_event_number == 0,
             self.quote,
             self.quoting,
             self.comment,
         ))
+    }
+
+    fn requires_prefix_replay(&self) -> bool {
+        self.headers
     }
 
     fn parse(
@@ -209,6 +213,7 @@ impl Parser for CsvParser {
         }
         if !data.is_empty() && !self.is_comment(data) {
             self.parse_record(data, &metadata, &mut errors);
+            self.last_event_number += 1;
         }
         (self.input_stream.take_all(), errors)
     }
@@ -766,6 +771,41 @@ pub mod test {
             b"first,second\nfoo,bar\n",
             &[r#"{"first": "foo", "second": "bar"}"#],
         );
+    }
+
+    /// A header-only message without a newline must not consume the next data row.
+    #[engine_test]
+    pub fn header_only_message(engine: &dyn ConnectorTestEngine) {
+        for header in [b"first,second".as_slice(), b"first,second\n"] {
+            let collection = engine
+                .input_collection(&relation(), &InputOptions::default())
+                .unwrap();
+            let mut parser = parser(
+                collection.as_ref(),
+                &FormatConfig {
+                    name: Cow::from("csv"),
+                    config: serde_json::json!({ "headers": true }),
+                },
+            );
+            let (mut buffer, errors) = parser.parse(header, None);
+            assert!(errors.is_empty());
+            buffer.flush().unwrap();
+            assert!(collection.is_empty());
+            let (mut buffer, errors) = parser.parse(b"foo,bar\nbaz,qux\n", None);
+            assert!(errors.is_empty());
+            buffer.flush().unwrap();
+            let updates = collection.updates().unwrap();
+            assert_eq!(
+                updates,
+                inserts(
+                    &updates,
+                    &[
+                        r#"{"first":"foo","second":"bar"}"#,
+                        r#"{"first":"baz","second":"qux"}"#,
+                    ],
+                )
+            );
+        }
     }
 
     /// The table of [`random_rows`].

@@ -10,6 +10,12 @@ Source edition can be found on github.
 
 ## Unreleased
 
+- Bug fix (File CSV input): checkpoint recovery and journal replay no longer
+  discard the first data row as a header. Existing offset-only checkpoints
+  remain readable; CSV with headers reconstructs parser state by rereading
+  the prefix without applying it. This costs a prefix scan on recovery and
+  reruns preprocessing, which must produce the same results as before.
+
 - Bug fix (input connectors): an error applying input to the circuit now stops
   the pipeline without checkpointing or journaling the failed batch. A flush
   may have applied only part of that batch; treating it as an ordinary

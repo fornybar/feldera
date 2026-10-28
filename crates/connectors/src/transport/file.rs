@@ -174,6 +174,42 @@ impl FileInputReader {
         Ok(Self { sender, unparker })
     }
 
+    /// Restore format state without changing the offset-only checkpoint format.
+    /// Only opted-in parsers reread the prefix; no prefix records are applied,
+    /// hashed or reported to the consumer. This also runs any preprocessing
+    /// again, so the prefix and its transformation must remain reproducible.
+    fn seek(
+        file: &mut File,
+        parser: &mut Box<dyn Parser>,
+        buffer_size: usize,
+        offset: u64,
+    ) -> AnyResult<StreamSplitter> {
+        if parser.requires_prefix_replay() {
+            *parser = parser.fork();
+            file.seek(SeekFrom::Start(0))?;
+            let mut prefix = StreamSplitter::new(parser.splitter());
+            let mut remaining = offset;
+            while remaining > 0 {
+                let limit = usize::try_from(remaining).unwrap_or(usize::MAX);
+                let n = prefix.read(file, buffer_size, limit)?;
+                if n == 0 {
+                    bail!("input file truncated before recovery offset {offset}");
+                }
+                remaining -= n as u64;
+                while let Some(chunk) = prefix.next(remaining == 0) {
+                    // Parsing returns unflushed buffers. Drop both the old
+                    // records and their already-reported parse errors.
+                    let _ = parser.parse(chunk, None);
+                }
+            }
+        } else {
+            file.seek(SeekFrom::Start(offset))?;
+        }
+        let mut splitter = StreamSplitter::new(parser.splitter());
+        splitter.seek(offset);
+        Ok(splitter)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn worker_thread(
         mut file: File,
@@ -189,9 +225,7 @@ impl FileInputReader {
         let mut splitter = StreamSplitter::new(parser.splitter());
 
         if let Some(resume_info) = resume_info {
-            let offset = resume_info.offsets.end;
-            file.seek(SeekFrom::Start(offset))?;
-            splitter.seek(offset);
+            splitter = Self::seek(&mut file, &mut parser, buffer_size, resume_info.offsets.end)?;
         }
 
         let mut staged_buffers = VecDeque::new();
@@ -255,8 +289,15 @@ impl FileInputReader {
                     }
                     Ok(InputReaderCommand::Replay { metadata, .. }) => {
                         let Metadata { offsets } = serde_json_path_to_error::from_value(metadata)?;
-                        file.seek(SeekFrom::Start(offsets.start))?;
-                        splitter.seek(offsets.start);
+                        if splitter.position() == offsets.start {
+                            // Contiguous replay already has the parser state
+                            // at this boundary, including for an empty range.
+                            file.seek(SeekFrom::Start(offsets.start))?;
+                            splitter.seek(offsets.start);
+                        } else {
+                            splitter =
+                                Self::seek(&mut file, &mut parser, buffer_size, offsets.start)?;
+                        }
                         let mut remainder = (offsets.end - offsets.start) as usize;
                         let mut total = BufferSize::empty();
                         let mut hasher = Xxh3Default::new();
@@ -423,6 +464,9 @@ struct Metadata {
 }
 
 #[cfg(any(test, feature = "testing"))]
+mod recovery_test;
+
+#[cfg(any(test, feature = "testing"))]
 pub mod test {
     use crate::test::{engine_test, input_pipeline, published_schema};
     use feldera_adapterlib::test::{
@@ -546,5 +590,107 @@ pub mod test {
         .unwrap();
         assert!(pipeline.collection.is_empty());
         pipeline.reader.disconnect();
+    }
+
+    fn csv_checkpoint_case(
+        engine: &dyn crate::test::pipeline::PipelineTestEngine,
+        headers: bool,
+        resume: bool,
+    ) {
+        use crate::test::{pipeline::TestCircuit, read};
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input.csv");
+        let output = dir.path().join("output.csv");
+        let storage = dir.path().join("storage");
+        std::fs::create_dir(&storage).unwrap();
+        let prefix = if headers {
+            "s|b|i\ncheckpoint|true|11\n"
+        } else {
+            "checkpoint|true|11\n"
+        };
+        let suffix = "resume-first|false|-37\nresume-second|true|809\n";
+        std::fs::write(&input, prefix).unwrap();
+        let config: crate::PipelineConfig = serde_json::from_value(json!({
+            "name":"file-csv-recovery", "workers":2, "storage":true,
+            "storage_config":{"path":storage}, "fault_tolerance":{},
+            "clock_resolution_usecs":null,
+            "inputs":{"test_input1":{"stream":"test_input1",
+                "transport":{"name":"file_input","config":{"path":input,"buffer_size_bytes":5}},
+                "format":{"name":"csv","config":{"delimiter":"|","headers":headers}}}},
+            "outputs":{"test_output1":{"stream":"test_output1",
+                "transport":{"name":"file_output","config":{"path":output}},
+                "format":{"name":"csv"}}}
+        }))
+        .unwrap();
+        let circuit = TestCircuit::Identity {
+            relation: relation(),
+            persistent_output_ids: vec![Some("output".into())],
+            input_properties: Vec::new(),
+            materialized: true,
+            persistent_ids: true,
+            table_version: 0,
+            attribute_defaults: BTreeMap::new(),
+        };
+        if resume {
+            let controller = engine
+                .controller(&circuit, &config, Box::new(|error, _| panic!("{error}")))
+                .unwrap();
+            controller.start();
+            wait(|| controller.pipeline_complete(), 10_000).unwrap();
+            let checkpoint = controller.checkpoint().unwrap();
+            assert_eq!(checkpoint.processed_records, 1);
+            let metadata = &checkpoint.input_metadata.0["test_input1"];
+            assert_eq!(metadata["offsets"]["end"], prefix.len() as u64);
+            println!("FILE CSV checkpoint headers={headers}: metadata={metadata}");
+            controller.stop().unwrap();
+            wait(|| engine.storage_released(&storage), 5_000).unwrap();
+        }
+        let mut append = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&input)
+            .unwrap();
+        append.write_all(suffix.as_bytes()).unwrap();
+        append.sync_all().unwrap();
+        let controller = engine
+            .controller(&circuit, &config, Box::new(|error, _| panic!("{error}")))
+            .unwrap();
+        controller.start();
+        // EOF plus drained output is a completion witness independent of the missing row.
+        wait(|| controller.pipeline_complete(), 10_000).unwrap();
+        controller.stop().unwrap();
+        wait(|| engine.storage_released(&storage), 5_000).unwrap();
+        let actual = read::csv_updates(&relation(), &std::fs::read(&output).unwrap()).unwrap();
+        let mut expected_rows = vec![
+            (1, r#"{"s":"resume-first","b":false,"i":-37}"#),
+            (1, r#"{"s":"resume-second","b":true,"i":809}"#),
+        ];
+        if !resume {
+            expected_rows.push((1, r#"{"s":"checkpoint","b":true,"i":11}"#));
+        }
+        let expected = Updates::from_json(published_schema(&relation()), &expected_rows).unwrap();
+        println!(
+            "FILE CSV headers={headers}, resume={resume}, actual={:?}, expected={:?}",
+            actual.zset().unwrap(),
+            expected.zset().unwrap()
+        );
+        assert_eq!(actual.zset().unwrap(), expected.zset().unwrap());
+    }
+
+    #[engine_test(requires(Storage, Checkpoints, FaultTolerance))]
+    pub fn csv_headers_checkpoint_resume(engine: &dyn crate::test::pipeline::PipelineTestEngine) {
+        csv_checkpoint_case(engine, true, true);
+    }
+
+    #[engine_test(requires(Storage, Checkpoints, FaultTolerance))]
+    pub fn csv_no_headers_checkpoint_resume(
+        engine: &dyn crate::test::pipeline::PipelineTestEngine,
+    ) {
+        csv_checkpoint_case(engine, false, true);
+    }
+
+    #[engine_test(requires(Storage, Checkpoints, FaultTolerance))]
+    pub fn csv_headers_fresh(engine: &dyn crate::test::pipeline::PipelineTestEngine) {
+        csv_checkpoint_case(engine, true, false);
     }
 }

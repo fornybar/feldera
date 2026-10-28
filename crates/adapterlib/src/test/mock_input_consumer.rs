@@ -296,6 +296,10 @@ impl Parser for MockInputParser {
         state.parser.splitter()
     }
 
+    fn requires_prefix_replay(&self) -> bool {
+        self.0.lock().unwrap().parser.requires_prefix_replay()
+    }
+
     fn stage(&self, buffers: Vec<Box<dyn InputBuffer>>) -> Box<dyn StagedBuffers> {
         self.0.lock().unwrap().parser.stage(buffers)
     }

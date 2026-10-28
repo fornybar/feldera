@@ -370,6 +370,17 @@ pub trait Parser: Send {
     /// into complete records to pass to [Parser::parse].
     fn splitter(&self) -> Box<dyn Splitter>;
 
+    /// Whether a byte-stream transport must reconstruct parser state before
+    /// resuming at a nonzero offset. For example, CSV must know whether its
+    /// header has already been consumed, even when earlier chunks held no rows.
+    ///
+    /// A transport supporting this parses the prefix with a fresh [Self::fork],
+    /// discarding its buffers without applying or counting them. Preprocessing
+    /// wrappers must forward this requirement and reconstruct the wrapped parser.
+    fn requires_prefix_replay(&self) -> bool {
+        false
+    }
+
     /// Create a new parser with the same configuration as `self`.
     ///
     /// Used by multithreaded transport endpoints to create multiple parallel
@@ -439,6 +450,10 @@ impl Parser for StreamingPreprocessedParser {
             return splitter;
         }
         self.parser.splitter()
+    }
+
+    fn requires_prefix_replay(&self) -> bool {
+        self.parser.requires_prefix_replay()
     }
 
     fn fork(&self) -> Box<dyn Parser> {
@@ -515,6 +530,10 @@ impl Parser for MessageOrientedPreprocessedParser {
             return splitter;
         }
         self.parser.splitter()
+    }
+
+    fn requires_prefix_replay(&self) -> bool {
+        self.parser.requires_prefix_replay()
     }
 
     fn fork(&self) -> Box<dyn Parser> {
