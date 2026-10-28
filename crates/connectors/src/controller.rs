@@ -881,28 +881,33 @@ impl Controller {
                             let run_result = catch_unwind(AssertUnwindSafe(|| {
                                 circuit_thread.run(&init_status_sender)
                             }));
-                            let panicked = run_result.is_err();
-                            match run_result {
-                                Ok(Ok(())) => (),
-                                Ok(Err(error)) => circuit_thread.controller.error(error, None),
-                                Err(_) => {
-                                    // The panic hook already logged the message
-                                    // and backtrace.  Without this report, the
-                                    // pipeline would keep reporting `Running`.
-                                    //
-                                    // Before initialization completes, `build`
-                                    // is still waiting on the channel and reports
-                                    // the failure itself; afterward it has dropped
-                                    // the receiver, so `send` fails and the error
-                                    // callback is the only way out.
-                                    let error = ControllerError::controller_panic();
-                                    if let Err(SendError(Err(error))) =
-                                        init_status_sender.send(Err(error))
-                                    {
-                                        circuit_thread.controller.error(error, None);
+                            let mut panicked = run_result.is_err();
+                            // An embedding error callback may itself panic.
+                            // Still run finish() so checkpoint publication is
+                            // cancelled or joined before this thread exits.
+                            let report_result =
+                                catch_unwind(AssertUnwindSafe(|| match run_result {
+                                    Ok(Ok(())) => (),
+                                    Ok(Err(error)) => circuit_thread.controller.error(error, None),
+                                    Err(_) => {
+                                        // The panic hook already logged the message
+                                        // and backtrace.  Without this report, the
+                                        // pipeline would keep reporting `Running`.
+                                        //
+                                        // Before initialization completes, `build`
+                                        // is still waiting on the channel and reports
+                                        // the failure itself; afterward it has dropped
+                                        // the receiver, so `send` fails and the error
+                                        // callback is the only way out.
+                                        let error = ControllerError::controller_panic();
+                                        if let Err(SendError(Err(error))) =
+                                            init_status_sender.send(Err(error))
+                                        {
+                                            circuit_thread.controller.error(error, None);
+                                        }
                                     }
-                                }
-                            }
+                                }));
+                            panicked |= report_result.is_err();
                             let finish_result = circuit_thread.finish().inspect_err(|error| {
                                 // Log the error before returning it from the
                                 // thread: otherwise, only [Controller::stop]
@@ -1597,7 +1602,12 @@ impl Controller {
     /// Initiate controller termination, but don't block waiting for it to finish.
     /// Can be used inside callbacks invoked by the controller without risking a deadlock.
     pub fn initiate_stop(&self) {
-        self.inner.stop();
+        // A synchronous input callback can hold the input map or reader lock.
+        // Only signal here; the circuit thread owns disconnect dispatch, and
+        // blocking stop joins that owner before waiting for reader cleanup.
+        self.inner.set_terminated();
+        self.inner.unpark_circuit();
+        self.inner.unpark_backpressure();
     }
 
     /// Terminate the controller, stop all input endpoints and destroy the
@@ -1616,6 +1626,10 @@ impl Controller {
                 .and_then(|result| result),
             None => Ok(()),
         };
+        // Normally finish() disconnected the readers. If the circuit thread
+        // panicked before finish(), do it here, after its owner was joined and
+        // while other blocking stop callers are still excluded.
+        self.inner.stop();
         // Cleanup can call back into the controller, so hold no status lock
         // while waiting. Finish it even if the circuit panicked.
         //
@@ -3828,9 +3842,24 @@ impl CircuitThread {
     }
 
     fn finish(mut self) -> Result<(), ControllerError> {
-        self.controller.set_terminated();
+        // Own disconnect dispatch for both API stops and internal failures.
+        // The input locks held during synchronous callbacks are released now.
+        self.controller.stop();
+        // A publisher owns checkpoint state and may still write the resume
+        // pointer. Fence it before killing the circuit releases storage for a
+        // new incarnation. Shutdown cancels its output wait; storage I/O that
+        // has already started must finish before stop returns.
+        let checkpoint_result = match self.running_checkpoint.take() {
+            Some(RunningCheckpoint::Waiting(handle, _)) => handle
+                .join()
+                .map_err(|_| ControllerError::controller_panic()),
+            _ => Ok(()),
+        };
+        // Cancellation callbacks can panic. Invoke them only after the
+        // publisher is joined, so unwinding cannot detach storage I/O.
         self.flush_commands_and_requests();
-        self.circuit.kill()
+        let circuit_result = self.circuit.kill();
+        checkpoint_result.and(circuit_result)
     }
 
     /// Clears the `restoring` flag (so the pipeline reports `Running` and admits
@@ -9278,20 +9307,23 @@ impl ControllerInner {
         // otherwise circular referenced between endpoints and the controller will leave
         // a cycle of garbage.
 
-        // Mark pipeline as terminated before removing endpoints, so endpoint removal doesn't
-        // end up getting recorded in the journal.
+        // Mark the pipeline as terminated before disconnecting readers, so
+        // teardown cannot be mistaken for endpoint removal in the journal.
         self.set_terminated();
 
-        // Prevent nested panic when stopping the pipeline in response to a panic.
-        let mut inputs = self.status.inputs.write();
-
-        for ep in inputs.values() {
-            if let Some(reader) = ep.reader.as_ref() {
-                reader.disconnect();
-            }
+        // Stop is not connector removal. A pending checkpoint or input step
+        // still needs the configuration, cursors and progress of every input.
+        // Taking readers breaks ownership cycles without erasing that state.
+        let readers: Vec<_> = self
+            .status
+            .inputs
+            .write()
+            .values_mut()
+            .filter_map(|endpoint| endpoint.reader.take())
+            .collect();
+        for reader in readers {
+            reader.disconnect();
         }
-        inputs.clear();
-        drop(inputs);
 
         self.unpark_circuit();
         self.unpark_backpressure();
@@ -10613,6 +10645,7 @@ impl RunningCheckpoint {
         let (sender, receiver) = oneshot::channel();
         let thread = CheckpointThread {
             status: circuit.controller.status.clone(),
+            shutdown: circuit.controller.shutdown_token().clone(),
             checkpoint,
             committer,
             written_before,
@@ -10686,6 +10719,7 @@ impl RunningCheckpoint {
 struct CheckpointThread {
     checkpoint: Checkpoint,
     status: Arc<ControllerStatus>,
+    shutdown: CancellationToken,
     committer: Box<dyn CheckpointCommitter>,
     written_before: u64,
     start_checkpoint: Instant,
@@ -10694,6 +10728,9 @@ struct CheckpointThread {
 
 impl CheckpointThread {
     fn run(mut self) -> Result<Checkpoint, ControllerError> {
+        if self.shutdown.is_cancelled() {
+            return Err(ControllerError::ControllerExit);
+        }
         // Commit all the operator checkpoints to stable storage.
         let publisher = self.committer.commit()?;
         let bytes_written = WRITE_BLOCKS_BYTES.sum() - self.written_before;
@@ -10703,6 +10740,9 @@ impl CheckpointThread {
         let mut long_wait = LongOperationWarning::new(Duration::from_secs(10));
         let threshold = self.checkpoint.processed_records;
         loop {
+            if self.shutdown.is_cancelled() {
+                return Err(ControllerError::ControllerExit);
+            }
             let completed = self.status.num_total_completed_records();
             if completed >= threshold {
                 if long_wait.elapsed() > Duration::from_secs(10) {
@@ -10766,6 +10806,9 @@ impl CheckpointThread {
         // Finalize the checkpoint on storage. [CheckpointPublisher::metadata]
         // reports the circuit's metadata before publication, so that the
         // state stored with the checkpoint can record it.
+        if self.shutdown.is_cancelled() {
+            return Err(ControllerError::ControllerExit);
+        }
         self.checkpoint.circuit = Some(publisher.metadata().clone());
         publisher.publish(&self.checkpoint)?;
 

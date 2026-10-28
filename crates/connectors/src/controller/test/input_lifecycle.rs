@@ -137,6 +137,7 @@ pub fn stop_fences_an_admitted_input_open(engine: &dyn PipelineTestEngine) {
 struct CleanupFile {
     inner: FileInputEndpoint,
     completion: Mutex<Option<futures::future::BoxFuture<'static, ()>>>,
+    disconnect: Option<Arc<DisconnectGate>>,
 }
 
 impl InputEndpoint for CleanupFile {
@@ -156,22 +157,31 @@ impl TransportInputEndpoint for CleanupFile {
         let reader: Arc<dyn InputReader> =
             Arc::from(self.inner.open(consumer, parser, schema, resume)?);
         let observed = reader.clone();
-        let completion = self.completion.lock().unwrap().take().unwrap();
-        Ok(Box::new(CleanupReader {
-            reader,
-            completion: Mutex::new(Some(Box::pin(async move {
+        let completion = self.completion.lock().unwrap().take().map(|completion| {
+            Box::pin(async move {
                 while !observed.is_closed() {
                     tokio::time::sleep(Duration::from_millis(1)).await;
                 }
                 completion.await;
-            }))),
+            }) as futures::future::BoxFuture<'static, ()>
+        });
+        Ok(Box::new(CleanupReader {
+            reader,
+            completion: Mutex::new(completion),
+            disconnect: self.disconnect.clone(),
         }))
     }
+}
+
+struct DisconnectGate {
+    entered: mpsc::Sender<()>,
+    release: Mutex<Option<mpsc::Receiver<()>>>,
 }
 
 struct CleanupReader {
     reader: Arc<dyn InputReader>,
     completion: Mutex<Option<futures::future::BoxFuture<'static, ()>>>,
+    disconnect: Option<Arc<DisconnectGate>>,
 }
 
 impl InputReader for CleanupReader {
@@ -180,6 +190,13 @@ impl InputReader for CleanupReader {
     }
 
     fn request(&self, command: InputReaderCommand) {
+        if matches!(command, InputReaderCommand::Disconnect)
+            && let Some(gate) = &self.disconnect
+            && let Some(release) = gate.release.lock().unwrap().take()
+        {
+            gate.entered.send(()).unwrap();
+            release.recv_timeout(TIMEOUT).unwrap();
+        }
         self.reader.request(command);
     }
 
@@ -211,6 +228,7 @@ pub fn concurrent_stop_waits_for_input_cleanup(engine: &dyn PipelineTestEngine) 
                     entered.send(()).unwrap();
                     gate.await.unwrap();
                 }))),
+                disconnect: None,
             }),
             None,
         )
@@ -233,4 +251,94 @@ pub fn concurrent_stop_waits_for_input_cleanup(engine: &dyn PipelineTestEngine) 
     first.join().unwrap();
     second.join().unwrap();
     assert!(!returned_early, "second stop returned before input cleanup");
+}
+
+fn disconnect_dispatch(engine: &dyn PipelineTestEngine, first_blocks: bool) {
+    init_test_logger();
+    let file = NamedTempFile::new().unwrap();
+    let controller = controller(engine);
+    let (entered, entry) = mpsc::channel();
+    let (release, gate) = mpsc::channel();
+    controller
+        .add_input_endpoint(
+            "dispatch",
+            file_config(file.path()),
+            Box::new(CleanupFile {
+                inner: FileInputEndpoint::new(
+                    serde_json::from_value(json!({ "path": file.path(), "follow": true })).unwrap(),
+                ),
+                // No completion hook: this checks ownership of Disconnect itself.
+                completion: Mutex::new(None),
+                disconnect: Some(Arc::new(DisconnectGate {
+                    entered,
+                    release: Mutex::new(Some(gate)),
+                })),
+            }),
+            None,
+        )
+        .unwrap();
+    let reader = controller.get_input_endpoint("dispatch").unwrap();
+    let first_controller = controller.clone();
+    let first = thread::spawn(move || {
+        if first_blocks {
+            first_controller.stop().unwrap();
+        } else {
+            first_controller.initiate_stop();
+        }
+    });
+    entry.recv_timeout(TIMEOUT).unwrap();
+    assert!(!reader.is_closed());
+    let (done, stopped) = mpsc::channel();
+    let second = thread::spawn(move || done.send(controller.stop()).unwrap());
+    let early = stopped.recv_timeout(Duration::from_millis(300)).ok();
+    let returned_early = early.is_some();
+    let closed_early = reader.is_closed();
+    release.send(()).unwrap();
+    early
+        .unwrap_or_else(|| stopped.recv_timeout(TIMEOUT).unwrap())
+        .unwrap();
+    first.join().unwrap();
+    second.join().unwrap();
+    wait(|| reader.is_closed(), 20_000).unwrap();
+    info!(
+        "disconnect first_blocks={first_blocks}, stop_returned_early={returned_early}, reader_closed_early={closed_early}"
+    );
+    assert!(
+        !returned_early,
+        "stop returned before Disconnect was dispatched"
+    );
+}
+
+#[engine_test]
+pub fn concurrent_stop_waits_for_disconnect_dispatch(engine: &dyn PipelineTestEngine) {
+    disconnect_dispatch(engine, true);
+}
+
+#[engine_test]
+pub fn stop_waits_for_initiated_disconnect_dispatch(engine: &dyn PipelineTestEngine) {
+    disconnect_dispatch(engine, false);
+}
+
+/// Even if reporting a callback panic triggers another panic in the error
+/// callback, blocking stop must still disconnect the readers.
+#[engine_test(requires(Profiles))]
+pub fn stop_disconnects_inputs_after_callback_panic(engine: &dyn PipelineTestEngine) {
+    init_test_logger();
+    let file = NamedTempFile::new().unwrap();
+    let controller = controller(engine);
+    controller
+        .connect_input("source", &file_config(file.path()), None)
+        .unwrap();
+    let reader = controller.get_input_endpoint("source").unwrap();
+    let (entered, entry) = mpsc::channel();
+    controller.start_graph_profile(Box::new(move |profile| {
+        profile.unwrap();
+        entered.send(()).unwrap();
+        panic!("injected profile callback panic");
+    }));
+    entry.recv_timeout(TIMEOUT).unwrap();
+    let stopped = controller.stop();
+    let closed = wait(|| reader.is_closed(), 20_000);
+    assert!(stopped.is_err(), "the callback panic was not reported");
+    closed.expect("stop left the File reader running after a callback panic");
 }

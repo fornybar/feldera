@@ -10,6 +10,11 @@ Source edition can be found on github.
 
 ## Unreleased
 
+- Bug fix (checkpointing): shutdown retains input cursors and waits for its
+  local checkpoint publisher before releasing storage. A checkpoint waiting
+  for output that shutdown cannot deliver is cancelled. Shutdown initiation
+  is callback-safe; blocking stop also waits for input disconnect dispatch.
+
 - Bug fix (controller): concurrent blocking stop calls now all wait for
   registered input cleanup, rather than only the first caller waiting.
 
