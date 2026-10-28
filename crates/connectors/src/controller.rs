@@ -4290,24 +4290,16 @@ impl CircuitThread {
         // Take the currently running checkpoint or try to start a new one.
         let running_checkpoint = if let Some(running_checkpoint) = self.running_checkpoint.take() {
             Ok(running_checkpoint)
-        } else if let Err(error) = self.controller.can_checkpoint() {
-            Err(error)
         } else {
-            // Let the coordinator (and anyone else) know that a checkpoint is
-            // in progress.
-            //
-            // We should do this as early as we can, because the first phase of
-            // checkpoint can take a while, but only after `can_checkpoint()`
-            // succeeds, because otherwise we'd immediately flip back to some
-            // other status below if the checkpoint is delayed e.g. due to a
-            // barrier.
-            self.set_checkpoint_coordination(Some(CheckpointCoordination::InProgress));
+            CheckpointInputs::capture(&self.controller).map(|inputs| {
+                // Publish InProgress only after checking the same inputs that
+                // the checkpoint will save. Admission after this snapshot
+                // belongs to a later checkpoint.
+                self.set_checkpoint_coordination(Some(CheckpointCoordination::InProgress));
 
-            // Start the checkpoint.
-            //
-            // This function can take a long time to run.  It calls into all the
-            // operators to checkpoint their state.
-            Ok(RunningCheckpoint::start(self))
+                // Preparing the operators' checkpoint state can take a while.
+                RunningCheckpoint::start(self, inputs)
+            })
         };
 
         let result = match running_checkpoint {
@@ -9647,6 +9639,15 @@ impl ControllerInner {
 
     /// Returns whether this pipeline supports checkpointing.
     pub fn can_checkpoint(&self) -> Result<(), SuspendError> {
+        let transaction_state = self.get_transaction_state();
+        self.can_checkpoint_with_inputs(&self.status.input_status(), transaction_state)
+    }
+
+    fn can_checkpoint_with_inputs(
+        &self,
+        inputs: &BTreeMap<EndpointId, InputEndpointStatus>,
+        transaction_state: TransactionState,
+    ) -> Result<(), SuspendError> {
         // First, check for reasons we can't checkpoint.
         let mut permanent = Vec::new();
         #[cfg(not(feature = "feldera-enterprise"))]
@@ -9655,7 +9656,7 @@ impl ControllerInner {
         if self.status.pipeline_config.global.storage.is_none() {
             permanent.push(PermanentSuspendError::StorageRequired);
         }
-        for endpoint_stats in self.status.input_status().values() {
+        for endpoint_stats in inputs.values() {
             if endpoint_stats.fault_tolerance.is_none() {
                 permanent.push(PermanentSuspendError::UnsupportedInputEndpoint(
                     endpoint_stats.endpoint_name.clone(),
@@ -9681,10 +9682,10 @@ impl ControllerInner {
         if self.status.bootstrap_in_progress() || self.status.concurrent_bootstrap_in_progress() {
             temporary.push(TemporarySuspendError::Bootstrapping);
         }
-        if self.get_transaction_state() != TransactionState::None {
+        if transaction_state != TransactionState::None {
             temporary.push(TemporarySuspendError::TransactionInProgress);
         }
-        for endpoint_stats in self.status.input_status().values() {
+        for endpoint_stats in inputs.values() {
             if endpoint_stats.is_barrier() {
                 temporary.push(TemporarySuspendError::InputEndpointBarrier(
                     endpoint_stats.endpoint_name.clone(),
@@ -10433,6 +10434,43 @@ impl OutputConsumer for OutputProbe {
     }
 }
 
+/// Eligibility, configuration and statistics from one locked input map.
+struct CheckpointInputs {
+    inputs: BTreeMap<Cow<'static, str>, InputEndpointConfig>,
+    input_statistics: HashMap<String, CheckpointInputEndpointMetrics>,
+}
+
+impl CheckpointInputs {
+    fn capture(controller: &ControllerInner) -> Result<Self, SuspendError> {
+        // Do not nest the input-status and transaction locks. The circuit
+        // thread owns transaction-state advancement during checkpoint capture.
+        let transaction_state = controller.get_transaction_state();
+        let statuses = controller.status.input_status();
+        controller.can_checkpoint_with_inputs(&statuses, transaction_state)?;
+        let inputs = statuses
+            .values()
+            .map(|status| {
+                let mut config = status.config.clone();
+                config.connector_config.paused = status.is_paused_by_user();
+                (Cow::from(status.endpoint_name.clone()), config)
+            })
+            .collect();
+        let input_statistics = statuses
+            .values()
+            .map(|status| {
+                (
+                    status.endpoint_name.clone(),
+                    CheckpointInputEndpointMetrics::from_endpoint_status(status),
+                )
+            })
+            .collect();
+        Ok(Self {
+            inputs,
+            input_statistics,
+        })
+    }
+}
+
 /// An in-progress checkpoint.
 ///
 /// Checkpoints proceed in three phases:
@@ -10465,48 +10503,26 @@ impl RunningCheckpoint {
     ///
     /// This function can take a long time to run.  It calls into all the
     /// operators to checkpoint their state.
-    fn start(circuit: &mut CircuitThread) -> Self {
+    fn start(circuit: &mut CircuitThread, inputs: CheckpointInputs) -> Self {
         Span::new("fg-checkpoint")
-            .in_scope(|| Self::start_inner(circuit))
+            .in_scope(|| Self::start_inner(circuit, inputs))
             .unwrap_or_else(Self::Error)
     }
 
-    fn start_inner(circuit: &mut CircuitThread) -> Result<Self, ControllerError> {
+    fn start_inner(
+        circuit: &mut CircuitThread,
+        inputs: CheckpointInputs,
+    ) -> Result<Self, ControllerError> {
         // Check that we already said that the checkpoint is in progress.
         debug_assert_eq!(
             *circuit.checkpoint_sender.borrow(),
             Some(CheckpointCoordination::InProgress)
         );
 
-        // Build both connector maps before the pipeline configuration, so that
-        // neither status lock is held while the other is taken.
-
-        // Replace the input connector configuration in the pipeline
-        // configuration by the current inputs.  (HTTP input connectors might
-        // have been added or removed.)
-        let (inputs, input_statistics) = {
-            let input_status = circuit.controller.status.input_status();
-            let inputs = input_status
-                .values()
-                .map(|status| {
-                    (Cow::from(status.endpoint_name.clone()), {
-                        let mut config = status.config.clone();
-                        config.connector_config.paused = status.is_paused_by_user();
-                        config
-                    })
-                })
-                .collect();
-            let statistics = input_status
-                .values()
-                .map(|status| {
-                    (
-                        status.endpoint_name.clone(),
-                        CheckpointInputEndpointMetrics::from_endpoint_status(status),
-                    )
-                })
-                .collect();
-            (inputs, statistics)
-        };
+        let CheckpointInputs {
+            inputs,
+            input_statistics,
+        } = inputs;
         #[cfg(any(test, feature = "testing"))]
         if let Some(hook) = circuit
             .controller

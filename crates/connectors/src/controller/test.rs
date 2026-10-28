@@ -78,6 +78,7 @@ use tokio::sync::oneshot;
 use tracing::info;
 use uuid::Uuid;
 
+mod checkpoint_admission;
 mod checkpoint_lifecycle;
 mod input_lifecycle;
 

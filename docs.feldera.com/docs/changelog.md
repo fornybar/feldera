@@ -10,6 +10,9 @@ Source edition can be found on github.
 
 ## Unreleased
 
+- Bug fix (checkpointing): validate and capture input connectors atomically,
+  so an input added concurrently cannot bypass checkpoint eligibility checks.
+
 - Bug fix (checkpointing): shutdown retains input cursors and waits for its
   local checkpoint publisher before releasing storage. A checkpoint waiting
   for output that shutdown cannot deliver is cancelled. Shutdown initiation
