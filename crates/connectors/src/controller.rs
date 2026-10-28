@@ -4561,6 +4561,9 @@ impl CircuitThread {
     ///   recovered, so the pipeline process should exit as soon as it can.
     /// - `Err(error)` if there was an error.
     fn input_step(&mut self) -> Result<Option<BufferSize>, ControllerError> {
+        if self.controller.input_apply_failed.load(Ordering::Acquire) {
+            return Ok(None);
+        }
         #[cfg(any(test, feature = "testing"))]
         if let Some(hook) = self.controller.input_step_hook.lock().unwrap().take() {
             hook(&mut self.input_metadata);
@@ -4789,6 +4792,13 @@ impl CircuitThread {
             }
             for endpoint_id in failed {
                 self.controller.disconnect_input(&endpoint_id);
+            }
+
+            // A reader can report extended even after check_flush failed.
+            // Its cursor describes the full batch, not the unknown subset
+            // applied to the circuit. Never evaluate or journal that step.
+            if self.controller.input_apply_failed.load(Ordering::Acquire) {
+                return Ok(None);
             }
 
             // Are we done?
@@ -7853,6 +7863,10 @@ pub struct ControllerInner {
     /// Worker completion, including readers removed before controller shutdown.
     input_completions: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 
+    /// An input flush failed after possibly mutating circuit input handles.
+    /// Unlike an ordinary stop or transport error, that step cannot commit.
+    input_apply_failed: AtomicBool,
+
     /// Opens hold a shared guard through reader installation and completion
     /// registration. Blocking stop fences them; initiate_stop never waits here.
     input_open_fence: parking_lot::RwLock<()>,
@@ -7989,6 +8003,7 @@ impl ControllerInner {
                 modified_output_endpoints,
                 bootstrapped_output_endpoints,
                 input_completions: Mutex::new(Vec::new()),
+                input_apply_failed: AtomicBool::new(false),
                 input_open_fence: parking_lot::RwLock::new(()),
                 #[cfg(any(test, feature = "testing"))]
                 checkpoint_snapshot_hook: Mutex::new(None),
@@ -10341,6 +10356,25 @@ impl InputConsumer for InputProbe {
         if fatal {
             self.controller
                 .end_transaction_for_stopped_connector(&self.endpoint_name, "failed");
+        }
+    }
+
+    fn check_flush(&self, result: Result<(), AnyError>) -> bool {
+        match result {
+            Ok(()) => true,
+            Err(error) => {
+                self.controller
+                    .input_apply_failed
+                    .store(true, Ordering::Release);
+                // Queue can call back synchronously under an input-map read
+                // guard. Cancel here; finish() performs the disconnect sweep
+                // after that guard is released, rather than deadlocking it.
+                self.controller.set_terminated();
+                self.controller.unpark_circuit();
+                self.controller.unpark_backpressure();
+                self.error(true, error, None);
+                false
+            }
         }
     }
 

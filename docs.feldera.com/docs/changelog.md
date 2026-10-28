@@ -10,6 +10,11 @@ Source edition can be found on github.
 
 ## Unreleased
 
+- Bug fix (input connectors): an error applying input to the circuit now stops
+  the pipeline without checkpointing or journaling the failed batch. A flush
+  may have applied only part of that batch; treating it as an ordinary
+  connector failure could otherwise persist a cursor past missing rows.
+
 - Bug fix (input connectors): removing an input during a step now retains it
   until that step's input and replay metadata have been recorded. Previously,
   a File input removed after applying rows could lose them on recovery.
