@@ -1606,7 +1606,10 @@ impl Controller {
         debug!("Stopping the circuit");
 
         self.initiate_stop();
-        let circuit_result = match self.circuit_thread_handle.lock().unwrap().take() {
+        // Serialize the entire blocking phase, not just the circuit join. A
+        // second caller must wait for the first caller's input cleanup too.
+        let mut circuit_thread_handle = self.circuit_thread_handle.lock().unwrap();
+        let circuit_result = match circuit_thread_handle.take() {
             Some(handle) => handle
                 .join()
                 .map_err(|_| ControllerError::controller_panic())
@@ -1630,6 +1633,7 @@ impl Controller {
                 let _ = completion.await;
             }
         });
+        drop(circuit_thread_handle);
         circuit_result
     }
 

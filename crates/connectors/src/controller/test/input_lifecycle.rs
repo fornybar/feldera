@@ -131,3 +131,106 @@ pub fn stop_fences_an_admitted_input_open(engine: &dyn PipelineTestEngine) {
     );
     assert!(!returned_early, "stop returned before the admitted open");
 }
+
+/// File has no asynchronous cleanup hook. Add one around its real reader to
+/// exercise the InputReader completion contract independently of a transport.
+struct CleanupFile {
+    inner: FileInputEndpoint,
+    completion: Mutex<Option<futures::future::BoxFuture<'static, ()>>>,
+}
+
+impl InputEndpoint for CleanupFile {
+    fn fault_tolerance(&self) -> Option<FtModel> {
+        self.inner.fault_tolerance()
+    }
+}
+
+impl TransportInputEndpoint for CleanupFile {
+    fn open(
+        &self,
+        consumer: Box<dyn InputConsumer>,
+        parser: Box<dyn Parser>,
+        schema: Relation,
+        resume: Option<serde_json::Value>,
+    ) -> anyhow::Result<Box<dyn InputReader>> {
+        let reader: Arc<dyn InputReader> =
+            Arc::from(self.inner.open(consumer, parser, schema, resume)?);
+        let observed = reader.clone();
+        let completion = self.completion.lock().unwrap().take().unwrap();
+        Ok(Box::new(CleanupReader {
+            reader,
+            completion: Mutex::new(Some(Box::pin(async move {
+                while !observed.is_closed() {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                completion.await;
+            }))),
+        }))
+    }
+}
+
+struct CleanupReader {
+    reader: Arc<dyn InputReader>,
+    completion: Mutex<Option<futures::future::BoxFuture<'static, ()>>>,
+}
+
+impl InputReader for CleanupReader {
+    fn as_any(self: Arc<Self>) -> Arc<dyn std::any::Any + Send + Sync> {
+        self
+    }
+
+    fn request(&self, command: InputReaderCommand) {
+        self.reader.request(command);
+    }
+
+    fn is_closed(&self) -> bool {
+        self.reader.is_closed()
+    }
+
+    fn take_completion(&self) -> Option<futures::future::BoxFuture<'static, ()>> {
+        self.completion.lock().unwrap().take()
+    }
+}
+
+#[engine_test]
+pub fn concurrent_stop_waits_for_input_cleanup(engine: &dyn PipelineTestEngine) {
+    init_test_logger();
+    let file = NamedTempFile::new().unwrap();
+    let controller = controller(engine);
+    let (entered, entry) = mpsc::channel();
+    let (release, gate) = oneshot::channel();
+    controller
+        .add_input_endpoint(
+            "cleanup",
+            file_config(file.path()),
+            Box::new(CleanupFile {
+                inner: FileInputEndpoint::new(
+                    serde_json::from_value(json!({ "path": file.path(), "follow": true })).unwrap(),
+                ),
+                completion: Mutex::new(Some(Box::pin(async move {
+                    entered.send(()).unwrap();
+                    gate.await.unwrap();
+                }))),
+            }),
+            None,
+        )
+        .unwrap();
+    let (first_done, first_result) = mpsc::channel();
+    let first_controller = controller.clone();
+    let first = thread::spawn(move || first_done.send(first_controller.stop()).unwrap());
+    entry.recv_timeout(TIMEOUT).unwrap();
+    assert!(first_result.try_recv().is_err());
+
+    let (second_done, second_result) = mpsc::channel();
+    let second = thread::spawn(move || second_done.send(controller.stop()).unwrap());
+    let early = second_result.recv_timeout(Duration::from_millis(300)).ok();
+    let returned_early = early.is_some();
+    release.send(()).unwrap();
+    first_result.recv_timeout(TIMEOUT).unwrap().unwrap();
+    early
+        .unwrap_or_else(|| second_result.recv_timeout(TIMEOUT).unwrap())
+        .unwrap();
+    first.join().unwrap();
+    second.join().unwrap();
+    assert!(!returned_early, "second stop returned before input cleanup");
+}

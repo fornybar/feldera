@@ -10,6 +10,9 @@ Source edition can be found on github.
 
 ## Unreleased
 
+- Bug fix (controller): concurrent blocking stop calls now all wait for
+  registered input cleanup, rather than only the first caller waiting.
+
 - Bug fix (input connectors): a connection opening during pipeline shutdown
   could panic or escape shutdown. Stopping now waits for admitted opens and
   rejects late connections before installing their readers.
