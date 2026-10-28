@@ -227,7 +227,11 @@ impl CircuitDriver for StaticCircuitDriver {
         let backend = self.backend.clone().ok_or_else(|| {
             ControllerError::dbsp_error(DbspError::Storage(StorageError::StorageDisabled))
         })?;
-        Ok(Box::new(StaticCheckpointCommitter { committer, backend }))
+        Ok(Box::new(StaticCheckpointCommitter {
+            committer,
+            backend,
+            runtime: self.handle.runtime().clone(),
+        }))
     }
 
     fn gc_checkpoint(&mut self, keep: HashSet<Uuid>) -> Result<(), ControllerError> {
@@ -340,6 +344,9 @@ impl CircuitDriver for StaticCircuitDriver {
 struct StaticCheckpointCommitter {
     committer: dbsp::circuit::CheckpointCommitter,
     backend: Arc<dyn StorageBackend>,
+    // Transfer the storage lease to the publisher, even if a worker error
+    // kills the circuit while the checkpoint runs on another thread.
+    runtime: Runtime,
 }
 
 impl CheckpointCommitter for StaticCheckpointCommitter {
@@ -351,6 +358,7 @@ impl CheckpointCommitter for StaticCheckpointCommitter {
         Ok(Box::new(StaticCheckpointPublisher {
             publisher,
             backend: self.backend,
+            runtime: self.runtime,
         }))
     }
 }
@@ -359,6 +367,9 @@ impl CheckpointCommitter for StaticCheckpointCommitter {
 struct StaticCheckpointPublisher {
     publisher: dbsp::circuit::CheckpointPublisher,
     backend: Arc<dyn StorageBackend>,
+    // Backends do not own the directory lock. Keep its runtime alive through
+    // the root state write, which follows the inner publisher's disposal.
+    runtime: Runtime,
 }
 
 impl CheckpointPublisher for StaticCheckpointPublisher {
@@ -367,11 +378,17 @@ impl CheckpointPublisher for StaticCheckpointPublisher {
     }
 
     fn publish(self: Box<Self>, state: &Checkpoint) -> Result<CheckpointMetadata, ControllerError> {
-        let Self { publisher, backend } = *self;
+        let Self {
+            publisher,
+            backend,
+            runtime,
+        } = *self;
         let uuid = publisher.metadata().uuid;
-        publish_with_state(&*backend, state, uuid, || {
+        let result = publish_with_state(&*backend, state, uuid, || {
             publisher.publish().map_err(ControllerError::dbsp_error)
-        })
+        });
+        drop(runtime);
+        result
     }
 }
 
@@ -540,10 +557,190 @@ impl Iterator for JsonProfileWriterChunks {
 
 #[cfg(test)]
 mod test {
-    use dbsp::profile::{DbspProfile, WorkerProfile};
-    use dbsp_connectors::engine::Engine;
+    use std::path::Path;
+    use std::sync::atomic::AtomicI64;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
-    use super::{JsonProfileWriterChunks, StaticEngine, StaticEngineArgs};
+    use dbsp::Runtime;
+    use dbsp::circuit::{CircuitConfig, Mode};
+    use dbsp::profile::{DbspProfile, WorkerProfile};
+    use dbsp::storage::dirlock::LockedDirectory;
+    use dbsp::utils::Tup2;
+    use dbsp_connectors::engine::{Checkpoint, CircuitDriver, Engine, PipelineStorage};
+    use feldera_storage::error::StorageError;
+    use feldera_storage::{DirEntry, FileReader, FileWriter, StorageBackend, StoragePath};
+    use feldera_types::config::PipelineConfig;
+    use feldera_types::constants::STATE_FILE;
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    use super::{JsonProfileWriterChunks, StaticCircuitDriver, StaticEngine, StaticEngineArgs};
+    use crate::storage::StaticStorage;
+    use crate::test::init_test_logger;
+
+    /// Observes the real directory lock at both state writes. In particular,
+    /// the root write happens after the inner DBSP publisher was consumed.
+    /// This wrapper holds only the backend, never a Runtime or lock lease.
+    struct ObservedStorage {
+        inner: Arc<dyn StorageBackend>,
+        writes: Mutex<Vec<(StoragePath, bool)>>,
+    }
+
+    impl StorageBackend for ObservedStorage {
+        fn create_named(&self, name: &StoragePath) -> Result<Box<dyn FileWriter>, StorageError> {
+            let locked = LockedDirectory::new(self.inner.file_system_path().unwrap()).is_err();
+            self.writes.lock().unwrap().push((name.clone(), locked));
+            self.inner.create_named(name)
+        }
+
+        fn open(&self, name: &StoragePath) -> Result<Arc<dyn FileReader>, StorageError> {
+            self.inner.open(name)
+        }
+
+        fn file_system_path(&self) -> Option<&Path> {
+            self.inner.file_system_path()
+        }
+
+        fn list(
+            &self,
+            parent: &StoragePath,
+            cb: &mut dyn FnMut(DirEntry),
+        ) -> Result<(), StorageError> {
+            self.inner.list(parent, cb)
+        }
+
+        fn delete(&self, name: &StoragePath) -> Result<(), StorageError> {
+            self.inner.delete(name)
+        }
+
+        fn delete_recursive(&self, name: &StoragePath) -> Result<(), StorageError> {
+            self.inner.delete_recursive(name)
+        }
+
+        fn fsync_dir(&self, dir: &StoragePath) -> Result<(), StorageError> {
+            self.inner.fsync_dir(dir)
+        }
+
+        fn usage(&self) -> Arc<AtomicI64> {
+            self.inner.usage()
+        }
+    }
+
+    fn checkpoint_storage_lease(worker_error: bool, publish: bool) {
+        init_test_logger();
+        let dir = TempDir::new().unwrap();
+        let config: PipelineConfig = serde_json::from_value(json!({
+            "name": "checkpoint-storage-lease",
+            "workers": 1,
+            "storage_config": { "path": dir.path() },
+            "storage": true,
+            "inputs": {},
+        }))
+        .unwrap();
+        let storage = StaticStorage::open(&config).unwrap().unwrap();
+        let backend = Arc::new(ObservedStorage {
+            inner: storage.backend().clone(),
+            writes: Mutex::new(Vec::new()),
+        });
+        let circuit_config = CircuitConfig::with_workers(1)
+            .with_mode(Mode::Persistent)
+            .with_allow_input_during_commit(false)
+            .with_storage(Some(storage.circuit_config(None, false)));
+        let (handle, input) = Runtime::init_circuit(circuit_config, |circuit| {
+            let (stream, input) = circuit.add_input_zset::<i64>();
+            stream.set_persistent_id(Some("input"));
+            stream.integrate_trace();
+            Ok(input)
+        })
+        .unwrap();
+        let shutdown = handle.runtime().cancellation_token();
+        let mut driver = StaticCircuitDriver {
+            handle,
+            inputs: Default::default(),
+            backend: Some(backend.clone()),
+        };
+        input.append(&mut vec![Tup2(11, 1), Tup2(23, 1)]);
+        driver.transaction().unwrap();
+        let publisher = driver.prepare_checkpoint(1, 2).unwrap().commit().unwrap();
+        if worker_error {
+            // A real worker command error synchronously kills the runtime.
+            // Do not keep a Runtime clone in the test: that would hide the bug.
+            let error = driver.step(Duration::ZERO).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("step called outside of a transaction"),
+                "{error}"
+            );
+            assert!(shutdown.is_cancelled());
+        } else {
+            driver.graph_profile().unwrap();
+            assert!(!shutdown.is_cancelled());
+        }
+        let released_before_publication = LockedDirectory::new(dir.path()).is_ok();
+        if publish {
+            let state = Checkpoint {
+                circuit: Some(publisher.metadata().clone()),
+                step: 1,
+                config,
+                processed_records: 2,
+                transaction_number: 1,
+                initial_start_time: chrono::DateTime::UNIX_EPOCH,
+                input_metadata: Default::default(),
+                input_statistics: Default::default(),
+                output_statistics: Default::default(),
+                input_distribution: Default::default(),
+            };
+            let metadata = publisher.publish(&state).unwrap();
+            let root: Checkpoint = storage.backend().read_json(&STATE_FILE.into()).unwrap();
+            assert_eq!(root.circuit.unwrap().uuid, metadata.uuid);
+            assert_eq!((root.step, root.processed_records), (1, 2));
+        } else {
+            drop(publisher);
+            assert!(storage.latest_checkpoint().unwrap().is_none());
+        }
+        Box::new(driver).kill().unwrap();
+        assert!(
+            LockedDirectory::new(dir.path()).is_ok(),
+            "storage lease leaked after completion"
+        );
+        let writes = backend.writes.lock().unwrap();
+        eprintln!(
+            "worker_error={worker_error}, publish={publish}, storage_released_before_publication={released_before_publication}, state_write_locks={writes:?}"
+        );
+        assert!(
+            !released_before_publication,
+            "pending publisher lost the storage lease"
+        );
+        if publish {
+            assert!(
+                writes
+                    .iter()
+                    .any(|(path, locked)| path.as_ref() == STATE_FILE && *locked),
+                "root state write was not protected by the storage lease"
+            );
+            assert!(
+                writes.iter().all(|(_, locked)| *locked),
+                "state written after releasing storage"
+            );
+        }
+    }
+
+    #[test]
+    fn checkpoint_storage_lease_survives_worker_error_until_publication() {
+        checkpoint_storage_lease(true, true);
+    }
+
+    #[test]
+    fn checkpoint_storage_lease_survives_worker_error_until_cancellation() {
+        checkpoint_storage_lease(true, false);
+    }
+
+    #[test]
+    fn checkpoint_storage_lease_normal_publication() {
+        checkpoint_storage_lease(false, true);
+    }
 
     /// The circuit is compiled into the binary, so the engine has no program loader, and
     /// its server refuses `--enable-program-load`.

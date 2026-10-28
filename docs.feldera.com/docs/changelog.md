@@ -10,6 +10,11 @@ Source edition can be found on github.
 
 ## Unreleased
 
+- Bug fix (checkpointing): a native checkpoint publisher now retains the
+  storage directory lock after a circuit worker fails, until publication
+  finishes or is cancelled. A new pipeline incarnation cannot acquire that
+  storage while the previous publisher can still write its resume pointer.
+
 - Bug fix (File CSV input): checkpoint recovery and journal replay no longer
   discard the first data row as a header. Existing offset-only checkpoints
   remain readable; CSV with headers reconstructs parser state by rereading
