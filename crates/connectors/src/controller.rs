@@ -8495,26 +8495,38 @@ impl ControllerInner {
             ));
         }
 
-        self.status.insert_input_endpoint(
-            endpoint_id,
-            InputEndpointStatus::new(
-                endpoint_name,
-                endpoint_config,
-                fault_tolerance,
-                initial_statistics.as_ref(),
-                preprocessor_watchdog,
-            ),
-            || {
-                let reader = open()?;
-                if let Some(completion) = reader.take_completion() {
-                    let mut completions = self.input_completions.lock().unwrap();
-                    completions.retain(|handle| !handle.is_finished());
-                    completions.push(TOKIO.spawn(completion));
-                }
-                Ok(reader)
-            },
-        )?;
+        let status = InputEndpointStatus::new(
+            endpoint_name,
+            endpoint_config,
+            fault_tolerance,
+            initial_statistics.as_ref(),
+            preprocessor_watchdog,
+        );
+        let needs_initial_resume =
+            fault_tolerance.is_some() && self.status.pipeline_config.global.storage.is_some();
+        // Install the barrier before the endpoint becomes visible to a
+        // checkpoint. Only this incarnation's first Queue response can supply
+        // its resume position; a cursor left by an older input with the same
+        // name is not valid, and a relative start may already be resolved.
+        status.set_barrier(needs_initial_resume);
+        self.status.insert_input_endpoint(endpoint_id, status, || {
+            let reader = open()?;
+            if let Some(completion) = reader.take_completion() {
+                let mut completions = self.input_completions.lock().unwrap();
+                completions.retain(|handle| !handle.is_finished());
+                completions.push(TOKIO.spawn(completion));
+            }
+            Ok(reader)
+        })?;
 
+        if needs_initial_resume && !self.restoring.load(Ordering::Acquire) {
+            // Queue does not resume ingestion. Even a paused, idle input must
+            // report its initial cursor before it can enter a checkpoint.
+            // Restoration already forces the first live Queue. Do not leave
+            // an extra request pending past replay, which would consume more
+            // live input (including a clock tick) after it has finished.
+            self.request_step();
+        }
         self.unpark_backpressure();
         Ok(endpoint_id)
     }

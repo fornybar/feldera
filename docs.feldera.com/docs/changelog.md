@@ -10,6 +10,11 @@ Source edition can be found on github.
 
 ## Unreleased
 
+- Bug fix (checkpointing): newly added inputs report their initial resume
+  position before entering a checkpoint, even while paused. This prevents an
+  idle Kafka `latest` input from skipping data after restart and a replacement
+  input from inheriting the previous input's cursor.
+
 - Bug fix (checkpointing): validate and capture input connectors atomically,
   so an input added concurrently cannot bypass checkpoint eligibility checks.
 

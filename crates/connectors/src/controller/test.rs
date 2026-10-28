@@ -80,6 +80,7 @@ use uuid::Uuid;
 
 mod checkpoint_admission;
 mod checkpoint_lifecycle;
+mod initial_resume;
 mod input_lifecycle;
 
 #[engine_test]
@@ -1278,7 +1279,6 @@ pub fn closed_reader_seek_cursor_is_not_journaled(engine: &dyn PipelineTestEngin
         "format": {"name": "csv"}
     }))
     .unwrap();
-    let cursor = json!({"offset": 0});
     let endpoint = input_transport_config_to_endpoint(
         &endpoint_config.connector_config.transport,
         "closed",
@@ -1291,6 +1291,9 @@ pub fn closed_reader_seek_cursor_is_not_journaled(engine: &dyn PipelineTestEngin
         .inner
         .add_input_endpoint("closed", endpoint_config, Some(endpoint), None)
         .unwrap();
+    // Establish a real resume position before failing the reader. An input
+    // that fails before its first Queue is correctly a checkpoint barrier.
+    let cursor = controller.checkpoint().unwrap().input_metadata.0["closed"].clone();
     let closed = ManualInputEndpoint::new();
     closed.closed.store(true, Ordering::Release);
     {
@@ -1866,11 +1869,9 @@ pub fn replay_does_not_feed_http_input_during_commit(engine: &dyn PipelineTestEn
 /// Replay must not wait for input from an endpoint that the replayed step
 /// did not record.
 ///
-/// `add_input_endpoint` registers an endpoint before `open` returns its
-/// reader.  A checkpoint in that window records the endpoint, but the next
-/// step skips it, because it has no reader yet, so the journal holds no
-/// input for it.  On restart, the checkpoint restores the endpoint and replay
-/// of that step must not wait for it.
+/// Checkpoint an idle endpoint, then close its reader. The next step skips
+/// that reader, so the journal holds no input for it. On restart, the
+/// checkpoint restores an open reader and replay must still not wait for it.
 #[engine_test(requires(Storage, Checkpoints, FaultTolerance))]
 pub fn replay_does_not_wait_for_endpoint_without_journaled_input(engine: &dyn PipelineTestEngine) {
     init_test_logger();
@@ -1927,13 +1928,34 @@ pub fn replay_does_not_wait_for_endpoint_without_journaled_input(engine: &dyn Pi
     )
     .unwrap();
 
-    // The checkpoint records BLOCKED, and the step that takes OPENED's row
-    // skips BLOCKED.
-    controller.checkpoint().unwrap();
-    let token = ingress_rows(&controller, OPENED, 0..1);
-    wait_for_completion(&controller, &token);
+    // A checkpoint cannot include an input before its initial Queue response.
+    // Release open before awaiting the checkpoint, with a bounded wait.
+    let (checkpoint_tx, checkpoint_rx) = mpsc::channel();
+    controller.start_checkpoint(Box::new(move |result| {
+        let _ = checkpoint_tx.send(result);
+    }));
     open_gate.send(()).unwrap();
     adding.join().unwrap().unwrap();
+    checkpoint_rx
+        .recv_timeout(Duration::from_secs(30))
+        .unwrap()
+        .unwrap();
+
+    // Keep the checkpointed endpoint, but close its live reader so the step
+    // that takes OPENED's row has no replay log for BLOCKED.
+    // HTTP's is_closed() always returns false, so use a closed test reader
+    // for the live run; checkpoint recovery reopens the real HTTP endpoint.
+    let id = controller.inner.input_endpoint_id_by_name(BLOCKED).unwrap();
+    let closed = ManualInputEndpoint::new();
+    closed.closed.store(true, Ordering::Release);
+    {
+        let mut statuses = controller.status().inputs.write();
+        let status = statuses.get_mut(&id).unwrap();
+        status.reader.as_ref().unwrap().disconnect();
+        status.reader = Some(Arc::new(closed));
+    }
+    let token = ingress_rows(&controller, OPENED, 0..1);
+    wait_for_completion(&controller, &token);
     controller.stop().unwrap();
 
     // Restart from the checkpoint and the journal.  The restart replays the
