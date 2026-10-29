@@ -10,6 +10,65 @@ Source edition can be found on github.
 
 ## Unreleased
 
+- Bug fixes and incompatible changes (NATS input connector): fault tolerance
+  is reworked; see [NATS input connector](/connectors/sources/nats).
+  - Replay reads journaled steps back by stream sequence with batched Direct
+    Get (or from the stream leader) instead of through a consumer. It feeds
+    exactly the step's messages, with the journaled record counts, and fails
+    instead of waiting forever when a message of the step was deleted.
+  - The connector reads with its own pull consumer instead of the client
+    library's ordered consumer, which could restart a consumer from the
+    beginning of the stream and ingest it twice.
+  - Stream backup and restore: each step now also records the sequence and
+    storage time of the last message the connector ingested, and the
+    connector identifies the stream by that message instead of only by the
+    stream's creation time.
+    - A stream restored from a backup that holds every message the pipeline
+      ingested (an exact or later backup) is accepted: the pipeline resumes
+      and replays from it. Before, this failed on nats-server 2.15, whose
+      restore gives the stream a new creation time.
+    - A stream restored from a backup older than the pipeline's checkpoint,
+      or deleted and recreated under the same name, fails with a fatal error.
+      Before, an older backup followed by new publishes that reused the lost
+      sequence numbers could make the connector skip the new messages.
+    - Not detected: unread messages published after the backup are lost with
+      the restore. A correct restore still fails if retention also removed
+      the last ingested message and the restore changed the creation time.
+      See [Backing up and restoring the stream](/connectors/sources/nats#backing-up-and-restoring-the-stream).
+    - Checkpoints written by earlier versions still load; they are checked by
+      the stream's creation time until the next step records a message.
+  - `New` and `Last` no longer skip messages published while the connector
+    was paused, and `LastPerSubject` replays exactly its snapshot.
+  - Resuming after the messages that the pipeline already read expired or
+    were purged no longer fails.
+  - Incompatible change: two configurations are now rejected when the
+    connector opens, instead of failing or misbehaving later:
+    - A `rate_limit` other than 0. NATS applies a rate limit only to push
+      consumers, and the connector reads with a pull consumer. Remove
+      `rate_limit`.
+    - `deliver_policy: LastPerSubject` without `filter_subjects`. NATS
+      delivers the last message of each subject only to a consumer with a
+      filter subject. Add `filter_subjects`, for example `[">"]` for every
+      subject.
+  - Recommended: turn on `allow_direct` on the JetStream stream (nats-server
+    2.11 or later), for example with
+    `nats stream edit <stream> --allow-direct`. Replay then reads up to 512
+    messages per batched Direct Get request. Without it, or on older servers,
+    replay reads each message from the stream leader with one request per
+    message, which is slower, and the connector logs a warning.
+  - New metric `input_connector_nats_replay_leader_fallbacks_total`.
+
+- NATS input and output connectors: the NATS client library `async-nats` is
+  upgraded from 0.47 to 0.51.
+  - Bug fix (NATS output connector): a message larger than the NATS server's
+    `max_payload` used to be sent, and the connector then waited for an
+    acknowledgment that never came and retried forever. The client library
+    now rejects such a message before sending it, and the connector reports
+    the error ("max payload size exceeded") at once. This only happens when the
+    connector's `max_message_size` is set above the server's `max_payload`;
+    otherwise the connector's own size check rejects the message first.
+    Remove `max_message_size` or lower it to the server's limit.
+
 - Experimental (Enterprise, Kubernetes): a resize of `memory_max` with
   `PATCH /v0/pipelines/{name}` also changes the memory budget of the
   running pipeline, unless `max_rss` is set.  A smaller budget applies at

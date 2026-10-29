@@ -65,10 +65,11 @@ async-channel = "2.3.1"
 # Its default feature set selects ring; aws-lc-rs is the same choice made
 # elsewhere in this workspace. The rest of the list restates the defaults, so
 # revisit it when upgrading.
-async-nats = { version = "0.47.0", default-features = false, features = [
+async-nats = { version = "0.51.0", default-features = false, features = [
     "server_2_10",
     "server_2_11",
     "server_2_12",
+    "server_2_14",
     "service",
     "aws-lc-rs",
     "jetstream",

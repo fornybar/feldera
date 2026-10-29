@@ -89,9 +89,11 @@ pub(crate) enum NatsMockAction {
     /// Sleep for the given duration.
     Sleep(Duration),
 
-    /// Drop the NATS process guard (kills the server).
+    /// Kill the server (SIGKILL), keeping its JetStream store.
     KillServer,
-    /// Restart NATS on the same TCP port used previously.
+    /// Restart NATS on the same TCP port used previously, on the store of the
+    /// server that `KillServer` killed: the (file-backed) stream is still
+    /// there, with its messages and creation time, as after a real restart.
     RestartNatsSamePort,
     /// Delete the stream via the JetStream API.
     DeleteStream,
@@ -205,12 +207,49 @@ pub(crate) enum NatsMockAction {
     DropStreamInfoReplies(usize),
     /// Assert that the endpoint has not reported a fatal error.
     AssertNoFatalError,
+
+    /// Create the stream with these subjects, and with or without
+    /// `allow_direct`.
+    CreateStreamWith {
+        subjects: &'static [&'static str],
+        allow_direct: bool,
+    },
+    /// Like `Publish`, to `subject`.
+    PublishTo {
+        subject: &'static str,
+        count: usize,
+    },
+    /// Publish each payload, as is, as one message to `subject`. The
+    /// payloads hold no record that `VerifyRecords` could check.
+    PublishRaw {
+        subject: &'static str,
+        payloads: &'static [&'static str],
+    },
+    /// Delete the message with this stream sequence.
+    DeleteMessage(u64),
+    /// Issue a replay of the step that this metadata describes.
+    ReplayStep(JsonValue),
+    /// Verify that the output is exactly the published records with these
+    /// stream sequences, in this order.
+    VerifySequences(&'static [usize]),
+    /// Assert that one of the endpoint's custom metrics has this value.
+    AssertCustomMetric {
+        name: &'static str,
+        value: f64,
+    },
+    /// Back up the stream with the JetStream snapshot API.
+    BackupStream,
+    /// Restore the stream from the backup that `BackupStream` took. The
+    /// stream must not exist.
+    RestoreStream,
 }
 
 /// Internal state held by the test runner.
 struct NatsMockRunner<'a> {
     engine: &'a dyn ConnectorTestEngine,
     nats_guard: Option<util::ProcessKillGuard>,
+    /// The JetStream store of the server that `KillServer` killed.
+    killed_store: Option<util::NatsStore>,
     nats_url: Option<String>,
     /// Published records, 1-indexed to match JetStream sequence numbers.
     /// `published[seq]` is the record with JetStream sequence number `seq`.
@@ -223,6 +262,8 @@ struct NatsMockRunner<'a> {
     got_fatal: Arc<AtomicBool>,
     error_count: Arc<AtomicUsize>,
     proxy: Option<JetStreamProxy>,
+    /// The backup that `BackupStream` took.
+    backup: Option<util::StreamBackup>,
     rt: tokio::runtime::Runtime,
 }
 
@@ -231,6 +272,7 @@ impl<'a> NatsMockRunner<'a> {
         Ok(Self {
             engine,
             nats_guard: None,
+            killed_store: None,
             nats_url: None,
             // Sentinel at index 0 so that `published[seq]` works directly
             // with 1-based JetStream sequence numbers.
@@ -242,6 +284,7 @@ impl<'a> NatsMockRunner<'a> {
             got_fatal: Arc::new(AtomicBool::new(false)),
             error_count: Arc::new(AtomicUsize::new(0)),
             proxy: None,
+            backup: None,
             rt: tokio::runtime::Runtime::new()?,
         })
     }
@@ -517,9 +560,11 @@ impl<'a> NatsMockRunner<'a> {
             }
 
             NatsMockAction::KillServer => {
-                self.nats_guard
+                let guard = self
+                    .nats_guard
                     .take()
                     .expect("KillServer: no NATS server to kill");
+                self.killed_store = Some(guard.kill_keeping_store());
             }
 
             NatsMockAction::RestartNatsSamePort => {
@@ -530,7 +575,8 @@ impl<'a> NatsMockRunner<'a> {
                     .1
                     .parse::<u16>()
                     .map_err(|e| anyhow::anyhow!("Invalid NATS URL port in {current_url}: {e}"))?;
-                let (guard, url) = util::start_nats_on_port(port)?;
+                let (guard, url) =
+                    util::start_nats_on_port_with_store(port, self.killed_store.take())?;
                 self.nats_guard = Some(guard);
                 self.nats_url = Some(url);
             }
@@ -994,6 +1040,82 @@ impl<'a> NatsMockRunner<'a> {
                     .drop_stream_info_replies(*n);
             }
 
+            NatsMockAction::CreateStreamWith {
+                subjects,
+                allow_direct,
+            } => {
+                let nats_url = self.nats_url().to_string();
+                self.rt.block_on(util::create_stream_with(
+                    &nats_url,
+                    util::stream_config(STREAM_NAME, subjects, *allow_direct),
+                ))?;
+            }
+
+            NatsMockAction::PublishTo { subject, count } => {
+                let start = self.published.len();
+                let records: Vec<JsonValue> = (start..start + count)
+                    .map(|i| json!({"s": format!("msg{i}"), "b": i % 2 == 0, "i": i as i64}))
+                    .collect();
+                let nats_url = self.nats_url().to_string();
+                self.rt
+                    .block_on(util::publish_json(&nats_url, subject, &records))?;
+                self.published.extend(records);
+            }
+
+            NatsMockAction::PublishRaw { subject, payloads } => {
+                let payloads: Vec<String> = payloads.iter().map(|p| p.to_string()).collect();
+                let nats_url = self.nats_url().to_string();
+                self.rt
+                    .block_on(util::publish_raw(&nats_url, subject, &payloads))?;
+                self.published
+                    .extend(payloads.iter().map(|_| JsonValue::Null));
+            }
+
+            NatsMockAction::DeleteMessage(sequence) => {
+                let nats_url = self.nats_url().to_string();
+                self.rt
+                    .block_on(util::delete_message(&nats_url, STREAM_NAME, *sequence))?;
+            }
+
+            NatsMockAction::ReplayStep(metadata) => {
+                self.endpoint().replay(metadata.clone(), rmpv::Value::Nil);
+            }
+
+            NatsMockAction::VerifySequences(sequences) => {
+                let received = self.collection().len();
+                assert_eq!(
+                    received,
+                    sequences.len(),
+                    "expected the records of sequences {sequences:?}, got {received} records"
+                );
+                for (index, sequence) in sequences.iter().enumerate() {
+                    assert_eq!(
+                        self.received(index..index + 1),
+                        self.published(*sequence..sequence + 1),
+                        "output[{index}] is not the record of sequence {sequence} (expected sequences {sequences:?})",
+                    );
+                }
+            }
+
+            NatsMockAction::AssertCustomMetric { name, value } => {
+                let actual = self.mock_input_consumer().custom_metric(name);
+                assert_eq!(actual, Some(*value), "metric {name}");
+            }
+
+            NatsMockAction::BackupStream => {
+                let nats_url = self.nats_url().to_string();
+                self.backup = Some(
+                    self.rt
+                        .block_on(util::backup_stream(&nats_url, STREAM_NAME))?,
+                );
+            }
+
+            NatsMockAction::RestoreStream => {
+                let nats_url = self.nats_url().to_string();
+                let backup = self.backup.as_ref().expect("BackupStream first");
+                self.rt.block_on(util::restore_stream(&nats_url, backup))?;
+            }
+
             NatsMockAction::AssertNoFatalError => {
                 assert!(
                     !self.got_fatal.load(Ordering::Acquire),
@@ -1169,12 +1291,15 @@ pub fn resume_after_server_becomes_available(engine: &dyn ConnectorTestEngine) {
                 timeout: Duration::from_secs(8),
             },
             RestartNatsSamePort,
-            CreateStream,
-            // Resume cursor is 2, so after restart publish enough messages to
-            // include sequences 2.. so at least two new records are consumed.
+            // The stream survived the restart with message 1; the connector
+            // continues with message 2.
             Publish(5),
-            WaitForRecordsNoFatal(5),
-            AssertRecordCount(5),
+            WaitForRecordsNoFatal(6),
+            AssertRecordCount(6),
+            VerifyRecords {
+                output_index: 0,
+                count: 6,
+            },
             DisconnectAllowNonFatal,
         ],
     )
@@ -1211,12 +1336,13 @@ pub fn pause_during_retry_loop(engine: &dyn ConnectorTestEngine) {
                 timeout: Duration::from_secs(8),
             },
             RestartNatsSamePort,
-            CreateStream,
-            // Resume cursor is 2 after first record; publish enough records so
-            // sequences >=2 exist in the new stream.
             Publish(4),
-            WaitForRecordsNoFatal(4),
-            AssertRecordCount(4),
+            WaitForRecordsNoFatal(5),
+            AssertRecordCount(5),
+            VerifyRecords {
+                output_index: 0,
+                count: 5,
+            },
             DisconnectAllowNonFatal,
         ],
     )
@@ -1277,15 +1403,16 @@ pub fn no_stale_error_after_pause_extend(engine: &dyn ConnectorTestEngine) {
             // but we pause immediately so the worker may not have processed it yet.
             KillServer,
             Pause,
-            // Restart server and recreate stream before extending.
+            // Restart the server before extending.
             RestartNatsSamePort,
-            CreateStream,
-            // Resume cursor is 2 after the first record; publish records with
-            // sequences >= 2.
             Publish(3),
             Extend,
-            WaitForRecordsNoFatal(3),
-            AssertRecordCount(3),
+            WaitForRecordsNoFatal(4),
+            AssertRecordCount(4),
+            VerifyRecords {
+                output_index: 0,
+                count: 4,
+            },
             DisconnectAllowNonFatal,
         ],
     )
@@ -1343,10 +1470,10 @@ pub fn mid_run_server_restart_recovers_no_fatal(engine: &dyn ConnectorTestEngine
             WaitForRecords(1),
             KillServer,
             RestartNatsSamePort,
-            CreateStream,
             Publish(5),
-            // At least one post-restart record should be consumed and no fatal error.
-            WaitForRecordsNoFatal(2),
+            // The post-restart records arrive, and no fatal error.
+            WaitForRecordsNoFatal(6),
+            AssertRecordCount(6),
             DisconnectAllowNonFatal,
         ],
     )
@@ -1483,7 +1610,7 @@ pub fn startup_connection_refused_retries_repeatedly(engine: &dyn ConnectorTestE
 
 /// Timeout for the server to reflect a consumer being created or deleted.
 ///
-/// Well below the 30s `inactive_threshold` of the ordered consumer, so a
+/// Well below the 60s `inactive_threshold` of the consumers, so a
 /// passing test proves explicit deletion rather than server-side expiry.
 pub(crate) const CONSUMER_COUNT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -2214,12 +2341,16 @@ pub fn replay_server_killed_retries_non_fatal(engine: &dyn ConnectorTestEngine) 
                 count: 1,
                 timeout: stall_timeout(),
             },
-            HoldStreamInfo,
+            // The stream survives the restart with its messages.
             RestartNatsSamePort,
-            CreateStream,
-            Publish(5_000),
-            ReleaseStreamInfo,
             WaitForReplayedRecordsNoFatal(5_000),
+            Sleep(Duration::from_millis(200)),
+            AssertRecordCount(5_000),
+            VerifyOutputSlice {
+                output_index: 0,
+                nats_seq: 1,
+                count: 5_000,
+            },
             DisconnectAllowNonFatal,
         ],
     )

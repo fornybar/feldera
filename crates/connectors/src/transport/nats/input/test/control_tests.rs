@@ -105,6 +105,17 @@ pub(crate) enum NatsControllerAction {
 
     /// Start the pipeline and assert startup fails fatally within timeout.
     ExpectStartupFatal,
+    /// Like [`NatsControllerAction::ExpectStartupFatal`], with an error that
+    /// contains this text.
+    ExpectStartupFatalContaining(&'static str),
+
+    /// Back up the stream with the JetStream snapshot API.
+    BackupStream,
+    /// Restore the stream from the backup that `BackupStream` took. The
+    /// stream must not exist.
+    RestoreStream,
+    /// Publish `n` records without running the pipeline.
+    Publish(usize),
 
     /// Like [`NatsControllerAction::RunFtCycle`] without a checkpoint, but
     /// while the pipeline runs, assert that every consumer on the stream is
@@ -142,7 +153,7 @@ pub(crate) enum NatsControllerAction {
 
 /// Timeout for the server to reflect consumers deleted by a stopped pipeline.
 ///
-/// Well below the 30s `inactive_threshold` of the ordered consumer, so a
+/// Well below the 60s `inactive_threshold` of the consumers, so a
 /// passing check proves explicit deletion rather than server-side expiry.
 const CONSUMER_DELETE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -167,10 +178,15 @@ pub(crate) struct NatsControllerRunner<'a> {
     pub(crate) given_name: Option<String>,
     pub(crate) inactivity_timeout_secs: Option<u64>,
     pub(crate) connector_options: Vec<(String, serde_json::Value)>,
+    /// Records per published message, as a JSON array if more than one.
+    pub(crate) records_per_message: usize,
 
     // Parsed pipeline config (built lazily after NATS URL is known)
     pub(crate) pipeline_config: Option<PipelineConfig>,
     pub(crate) controller: Option<Controller>,
+
+    /// The backup that `BackupStream` took.
+    pub(crate) backup: Option<util::StreamBackup>,
 
     // Cumulative record bookkeeping across rounds
     pub(crate) total_published: usize,
@@ -199,8 +215,10 @@ impl<'a> NatsControllerRunner<'a> {
             given_name: None,
             inactivity_timeout_secs: None,
             connector_options: Vec::new(),
+            records_per_message: 1,
             pipeline_config: None,
             controller: None,
+            backup: None,
             total_published: 0,
             checkpointed: 0,
         })
@@ -232,6 +250,12 @@ impl<'a> NatsControllerRunner<'a> {
         value: impl Into<serde_json::Value>,
     ) -> Self {
         self.connector_options.push((key.to_string(), value.into()));
+        self
+    }
+
+    /// Publishes `n` records per message, as one JSON array.
+    pub(crate) fn with_records_per_message(mut self, n: usize) -> Self {
+        self.records_per_message = n;
         self
     }
 
@@ -333,6 +357,9 @@ impl<'a> NatsControllerRunner<'a> {
             if let Some(given_name) = &self.given_name {
                 config["given_name"] = json!(given_name);
             }
+            if self.records_per_message > 1 {
+                config["inputs"]["test_input1"]["format"]["config"]["array"] = json!(true);
+            }
 
             self.pipeline_config = Some(serde_json::from_value(config).unwrap());
         }
@@ -352,8 +379,17 @@ impl<'a> NatsControllerRunner<'a> {
         let start = self.total_published;
         let records: Vec<JsonValue> = (start..start + publish).map(record).collect();
         let nats_url = self.nats_url().to_string();
-        self.rt
-            .block_on(util::publish_json(&nats_url, SUBJECT_NAME, &records))?;
+        if self.records_per_message > 1 {
+            let messages: Vec<JsonValue> = records
+                .chunks(self.records_per_message)
+                .map(|chunk| JsonValue::Array(chunk.to_vec()))
+                .collect();
+            self.rt
+                .block_on(util::publish_json(&nats_url, SUBJECT_NAME, &messages))?;
+        } else {
+            self.rt
+                .block_on(util::publish_json(&nats_url, SUBJECT_NAME, &records))?;
+        }
         self.total_published += publish;
 
         Ok(())
@@ -720,53 +756,27 @@ impl<'a> NatsControllerRunner<'a> {
                 controller.stop().unwrap();
             }
 
-            NatsControllerAction::ExpectStartupFatal => {
-                assert!(
-                    self.controller.is_none(),
-                    "ExpectStartupFatal requires no running controller"
-                );
+            NatsControllerAction::ExpectStartupFatal => self.expect_startup_fatal(None),
 
-                let got_fatal = Arc::new(AtomicBool::new(false));
-                let got_fatal_clone = got_fatal.clone();
-                let panicked = Arc::new(AtomicBool::new(false));
-                let panicked_clone = panicked.clone();
-                let config = self.pipeline_config().clone();
-                let controller = self
-                    .engine
-                    .controller(
-                        &circuit(),
-                        &config,
-                        Box::new(move |e, _tag| {
-                            println!("Controller error: {e}");
-                            got_fatal_clone.store(true, Ordering::Release);
-                            if matches!(e.as_ref(), crate::ControllerError::ControllerPanic) {
-                                panicked_clone.store(true, Ordering::Release);
-                            }
-                        }),
-                    )
-                    .unwrap();
-                controller.start();
+            NatsControllerAction::ExpectStartupFatalContaining(needle) => {
+                self.expect_startup_fatal(Some(needle))
+            }
 
-                let timeout_ms = self
-                    .inactivity_timeout_secs
-                    .map(|s| (s + 15) * 1000)
-                    .unwrap_or(30_000);
-
-                let result = wait(|| got_fatal.load(Ordering::Acquire), timeout_ms);
-
-                if result.is_err() {
-                    eprintln!(
-                        "FAIL: Expected a fatal startup error within {timeout_ms}ms, but none was reported."
-                    );
-                    std::process::abort();
-                }
-
-                controller.stop().unwrap();
-                assert!(
-                    !panicked.load(Ordering::Acquire),
-                    "startup failure panicked the circuit"
+            NatsControllerAction::BackupStream => {
+                let nats_url = self.nats_url().to_string();
+                self.backup = Some(
+                    self.rt
+                        .block_on(util::backup_stream(&nats_url, STREAM_NAME))?,
                 );
             }
+
+            NatsControllerAction::RestoreStream => {
+                let nats_url = self.nats_url().to_string();
+                let backup = self.backup.as_ref().expect("BackupStream first");
+                self.rt.block_on(util::restore_stream(&nats_url, backup))?;
+            }
+
+            NatsControllerAction::Publish(n) => self.publish_records(*n)?,
 
             NatsControllerAction::RunUntilConnectorFatal { publish } => {
                 self.publish_records(*publish)?;
@@ -856,6 +866,71 @@ impl<'a> NatsControllerRunner<'a> {
             }
         }
         Ok(())
+    }
+}
+
+impl NatsControllerRunner<'_> {
+    /// Starts the pipeline and asserts that it fails fatally within a
+    /// timeout, with an error that contains `needle` if it is set.
+    fn expect_startup_fatal(&mut self, needle: Option<&str>) {
+        assert!(
+            self.controller.is_none(),
+            "ExpectStartupFatal requires no running controller"
+        );
+
+        let errors = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let errors_clone = errors.clone();
+        let panicked = Arc::new(AtomicBool::new(false));
+        let panicked_clone = panicked.clone();
+        let config = self.pipeline_config().clone();
+        let controller = self
+            .engine
+            .controller(
+                &circuit(),
+                &config,
+                Box::new(move |e, _tag| {
+                    println!("Controller error: {e}");
+                    errors_clone.lock().unwrap().push(format!("{e:#}"));
+                    if matches!(e.as_ref(), crate::ControllerError::ControllerPanic) {
+                        panicked_clone.store(true, Ordering::Release);
+                    }
+                }),
+            )
+            .unwrap();
+        controller.start();
+
+        let timeout_ms = self
+            .inactivity_timeout_secs
+            .map(|s| (s + 15) * 1000)
+            .unwrap_or(30_000);
+
+        let result = wait(
+            || {
+                errors
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|error| needle.is_none_or(|needle| error.contains(needle)))
+            },
+            timeout_ms,
+        );
+
+        if result.is_err() {
+            eprintln!(
+                "FAIL: Expected a fatal startup error{} within {timeout_ms}ms, but got: {:?}",
+                needle
+                    .map(|needle| format!(" containing {needle:?}"))
+                    .unwrap_or_default(),
+                errors.lock().unwrap()
+            );
+            std::process::abort();
+        }
+
+        controller.stop().unwrap();
+        assert!(
+            !panicked.load(Ordering::Acquire),
+            "startup failure panicked the circuit"
+        );
     }
 }
 
@@ -1441,4 +1516,183 @@ pub(crate) fn test_controller_stop_waits_for_delete(
             },
         ],
     )
+}
+
+/// Replaying steps whose messages hold several records each reproduces the
+/// journaled record counts and hashes: earlier versions counted one record
+/// per message on replay, and the controller refused the replay.
+#[engine_test(requires(Storage, Checkpoints, FaultTolerance), services(Nats))]
+pub fn ft_replay_of_multi_record_messages(engine: &dyn PipelineTestEngine) {
+    use NatsControllerAction::*;
+    run_nats_controller_test(
+        NatsControllerRunner::new(engine)
+            .unwrap()
+            .with_records_per_message(3),
+        &[
+            StartNats,
+            CreateStream,
+            RunFtCycle {
+                publish: 9,
+                checkpoint: true,
+            },
+            RunFtCycle {
+                publish: 12,
+                checkpoint: false,
+            },
+            RunFtCycle {
+                publish: 6,
+                checkpoint: true,
+            },
+        ],
+    )
+    .unwrap();
+}
+
+/// A pipeline resumes after every message it already read was removed (by
+/// a purge here, by `max_age` or `max_msgs` in production): nothing it has
+/// not read is missing. Earlier versions failed on the empty stream.
+#[engine_test(requires(Storage, Checkpoints, FaultTolerance), services(Nats))]
+pub fn ft_resume_after_read_messages_were_removed(engine: &dyn PipelineTestEngine) {
+    use NatsControllerAction::*;
+    run_nats_ft_default(
+        engine,
+        &[
+            StartNats,
+            CreateStream,
+            RunFtCycle {
+                publish: 5,
+                checkpoint: true,
+            },
+            PurgeStream,
+            RunFtCycle {
+                publish: 0,
+                checkpoint: true,
+            },
+            RunFtCycle {
+                publish: 5,
+                checkpoint: true,
+            },
+        ],
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Backup and restore of the stream
+// ---------------------------------------------------------------------------
+
+/// A pipeline resumes from its checkpoint after its stream was backed up,
+/// deleted, and restored with the same messages, even though the restore
+/// gives the stream a new creation time (nats-server 2.15, and clustered
+/// restores on some earlier versions).
+#[engine_test(requires(Storage, Checkpoints, FaultTolerance), services(Nats))]
+pub fn ft_resume_after_exact_restore(engine: &dyn PipelineTestEngine) {
+    use NatsControllerAction::*;
+    run_nats_ft_default(
+        engine,
+        &[
+            StartNats,
+            CreateStream,
+            RunFtCycle {
+                publish: 5,
+                checkpoint: true,
+            },
+            BackupStream,
+            DeleteStream,
+            RestoreStream,
+            RunFtCycle {
+                publish: 5,
+                checkpoint: true,
+            },
+        ],
+    );
+}
+
+/// After an exact restore, the steps after the checkpoint replay from the
+/// restored stream.
+#[engine_test(requires(Storage, Checkpoints, FaultTolerance), services(Nats))]
+pub fn ft_replay_after_exact_restore(engine: &dyn PipelineTestEngine) {
+    use NatsControllerAction::*;
+    run_nats_ft_default(
+        engine,
+        &[
+            StartNats,
+            CreateStream,
+            RunFtCycle {
+                publish: 5,
+                checkpoint: true,
+            },
+            RunFtCycle {
+                publish: 5,
+                checkpoint: false,
+            },
+            BackupStream,
+            DeleteStream,
+            RestoreStream,
+            RunFtCycle {
+                publish: 3,
+                checkpoint: true,
+            },
+        ],
+    );
+}
+
+/// A restore from a backup older than the checkpoint loses messages that the
+/// pipeline ingested, and new messages then reuse their sequence numbers.
+/// The pipeline must stop rather than skip the new messages as if it had
+/// ingested them.
+#[engine_test(requires(Storage, Checkpoints, FaultTolerance), services(Nats))]
+pub fn ft_restore_of_older_backup_is_fatal(engine: &dyn PipelineTestEngine) {
+    use NatsControllerAction::*;
+    run_nats_ft_default(
+        engine,
+        &[
+            StartNats,
+            CreateStream,
+            RunFtCycle {
+                publish: 5,
+                checkpoint: true,
+            },
+            BackupStream,
+            RunFtCycle {
+                publish: 5,
+                checkpoint: true,
+            },
+            DeleteStream,
+            RestoreStream,
+            // Messages 6 to 10, which the pipeline ingested, are gone.
+            ExpectStartupFatal,
+            // New messages 6 to 10, which the pipeline has not ingested,
+            // although it ingested messages with these sequence numbers.
+            Publish(5),
+            ExpectStartupFatalContaining("is not the stream this pipeline read before"),
+        ],
+    );
+}
+
+/// The same as [ft_restore_of_older_backup_is_fatal], for steps after the
+/// checkpoint that the pipeline replays: replaying the new messages at the
+/// same sequence numbers would feed it other data.
+#[engine_test(requires(Storage, Checkpoints, FaultTolerance), services(Nats))]
+pub fn ft_replay_after_restore_of_older_backup_is_fatal(engine: &dyn PipelineTestEngine) {
+    use NatsControllerAction::*;
+    run_nats_ft_default(
+        engine,
+        &[
+            StartNats,
+            CreateStream,
+            RunFtCycle {
+                publish: 5,
+                checkpoint: true,
+            },
+            BackupStream,
+            RunFtCycle {
+                publish: 5,
+                checkpoint: false,
+            },
+            DeleteStream,
+            RestoreStream,
+            Publish(5),
+            ExpectStartupFatalContaining("is not the stream this pipeline read before"),
+        ],
+    );
 }

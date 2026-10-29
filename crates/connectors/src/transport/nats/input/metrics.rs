@@ -28,6 +28,7 @@ pub(super) struct NatsInputMetrics {
     retries: AtomicU64,
     consecutive_failures: AtomicU64,
     retry_state: AtomicU64,
+    replay_leader_fallbacks: AtomicU64,
 }
 
 impl NatsInputMetrics {
@@ -45,6 +46,12 @@ impl NatsInputMetrics {
     pub(super) fn consumer_delete_failed(&self) {
         self.consumer_delete_failures
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A replay read a step from the stream leader because Direct Get did
+    /// not return it intact.
+    pub(super) fn replay_leader_fallback(&self) {
+        self.replay_leader_fallbacks.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Records one retry attempt and the number of consecutive failures so far.
@@ -70,6 +77,7 @@ impl NatsInputMetrics {
             retries: self.retries.load(Ordering::Relaxed),
             consecutive_failures: self.consecutive_failures.load(Ordering::Relaxed),
             retry_state: self.retry_state.load(Ordering::Relaxed),
+            replay_leader_fallbacks: self.replay_leader_fallbacks.load(Ordering::Relaxed),
         }
     }
 }
@@ -83,6 +91,7 @@ pub(super) struct NatsInputMetricsSnapshot {
     pub retries: u64,
     pub consecutive_failures: u64,
     pub retry_state: u64,
+    pub replay_leader_fallbacks: u64,
 }
 
 impl ConnectorMetrics for NatsInputMetrics {
@@ -124,6 +133,12 @@ impl ConnectorMetrics for NatsInputMetrics {
                 ValueType::Gauge,
                 self.retry_state.load(Ordering::Relaxed) as f64,
             ),
+            (
+                "input_connector_nats_replay_leader_fallbacks_total",
+                "Number of replayed steps read from the stream leader because Direct Get (from any replica) did not return them intact, for example from a lagging replica or mirror.",
+                ValueType::Counter,
+                self.replay_leader_fallbacks.load(Ordering::Relaxed) as f64,
+            ),
         ]
     }
 }
@@ -140,6 +155,7 @@ mod tests {
         metrics.consumer_created();
         metrics.consumer_deleted();
         metrics.consumer_delete_failed();
+        metrics.replay_leader_fallback();
         metrics.set_retry_state(RetryState::Retrying);
         metrics.retry_attempt(3);
 
@@ -147,6 +163,7 @@ mod tests {
         assert_eq!(snapshot.consumers_created, 2);
         assert_eq!(snapshot.consumers_deleted, 1);
         assert_eq!(snapshot.consumer_delete_failures, 1);
+        assert_eq!(snapshot.replay_leader_fallbacks, 1);
         assert_eq!(snapshot.retries, 1);
         assert_eq!(snapshot.consecutive_failures, 3);
         assert_eq!(snapshot.retry_state, RetryState::Retrying as u64);
@@ -161,7 +178,7 @@ mod tests {
     fn exported_metric_names_are_prometheus_safe() {
         let metrics = NatsInputMetrics::default();
         let exported = metrics.metrics();
-        assert_eq!(exported.len(), 6);
+        assert_eq!(exported.len(), 7);
         for (name, help, value_type, _) in exported {
             assert!(
                 name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),

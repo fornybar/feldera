@@ -181,15 +181,15 @@ pub fn retry_max_attempts_counts_one_outage_at_a_time(engine: &dyn ConnectorTest
             CreatePipeline,
             Extend,
             WaitForRecords(1),
-            // One failed inactivity health check: the probe and its fallback.
-            DropStreamInfoReplies(2),
+            // One failed inactivity health check.
+            DropStreamInfoReplies(1),
             WaitForErrorCountAtLeast {
                 count: 1,
                 timeout: Duration::from_secs(20),
             },
             // Recover, then stay healthy for several retry intervals.
             Sleep(Duration::from_secs(5)),
-            DropStreamInfoReplies(2),
+            DropStreamInfoReplies(1),
             WaitForErrorCountAtLeast {
                 count: 2,
                 timeout: Duration::from_secs(20),
@@ -478,14 +478,15 @@ pub fn pause_and_disconnect_delete_consumer(engine: &dyn ConnectorTestEngine) {
 /// After a pause and resume, the connector reads from a consumer positioned
 /// after the last message. If that consumer is deleted before it delivers
 /// anything (for example by an operator cleaning up consumers by prefix),
-/// the client library recreates it with `DeliverPolicy::All` and the
-/// connector ingests every message again.
+/// the connector reports a (non-fatal) error and recreates it at its own
+/// position. Earlier versions let the client library recreate it, with
+/// `DeliverPolicy::All`, and ingested every message again.
 #[engine_test(services(Nats))]
 pub fn deleted_positioned_consumer_does_not_reingest(engine: &dyn ConnectorTestEngine) {
     use NatsMockAction::*;
     run_nats_mock_test(
         engine,
-        basic_nats_config,
+        |nats_url| fast_retry_config(nats_url, json!({})),
         &[
             StartNats,
             CreateStream,
@@ -504,9 +505,15 @@ pub fn deleted_positioned_consumer_does_not_reingest(engine: &dyn ConnectorTestE
                 timeout: CONSUMER_COUNT_TIMEOUT,
             },
             DeleteConsumers,
-            QueueFor(Duration::from_secs(5)),
-            AssertRecordCount(3),
-            Disconnect,
+            Publish(1),
+            WaitForRecordsNoFatal(4),
+            QueueFor(Duration::from_secs(2)),
+            AssertRecordCount(4),
+            VerifyRecords {
+                output_index: 0,
+                count: 4,
+            },
+            DisconnectAllowNonFatal,
         ],
     )
     .unwrap();
@@ -603,35 +610,39 @@ pub fn replay_deletes_consumer(engine: &dyn ConnectorTestEngine) {
     .unwrap();
 }
 
-/// A consumer that the client library is recreating when the connector
-/// pauses must not outlive the pause.
+/// A consumer create in flight when the connector pauses must not outlive
+/// the pause, and must not hold up the pipeline's steps meanwhile.
 ///
-/// The connector assumes that once the reader task is gone, "nothing can
-/// race the delete". A recreate the library already sent can still be
-/// applied after the delete; the proxy forces that order.
+/// The server creates the consumer but its reply is lost, so the create
+/// times out. The start of a reader runs on its own task: `Queue` still
+/// completes at once, and `Pause` does not wait for the create, whose
+/// consumer is deleted once its outcome is known.
 #[engine_test(services(Nats))]
-pub fn inflight_library_recreate_is_cleaned_up_on_pause(engine: &dyn ConnectorTestEngine) {
+pub fn inflight_create_is_cleaned_up_on_pause(engine: &dyn ConnectorTestEngine) {
     use NatsMockAction::*;
     run_nats_mock_test(
         engine,
-        basic_nats_config,
+        |nats_url| fast_retry_config(nats_url, json!({})),
         &[
             StartNats,
             CreateStream,
             StartProxy(ProxyFaults {
-                consumer_deleted_on_first_pull: true,
-                hold_create_until_delete: Some(2),
+                drop_create_reply: Some(1),
                 ..Default::default()
             }),
             CreatePipeline,
             Extend,
-            // The library's recreate (create number 2) is now held.
-            Sleep(Duration::from_secs(1)),
+            // The create is now waiting for its lost reply.
+            Sleep(Duration::from_millis(300)),
+            QueueCompletesWithin(Duration::from_millis(500)),
             Pause,
+            // Past the create's timeout (1s), when its outcome is known.
+            Sleep(Duration::from_secs(2)),
             WaitForConsumerCount {
                 count: 0,
                 timeout: CONSUMER_COUNT_TIMEOUT,
             },
+            AssertConsumerCountersMatchServer,
             Disconnect,
         ],
     )

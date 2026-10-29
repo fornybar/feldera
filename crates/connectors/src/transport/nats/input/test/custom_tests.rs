@@ -1,7 +1,6 @@
-use super::super::ConnectorError;
+use super::super::{ConnectorError, StreamState, validate_resume_position};
 use crate::transport::input_transport_config_to_endpoint;
-use crate::transport::nats::input::test::util;
-use async_nats::jetstream;
+use crate::transport::nats::input::{replay::validate_replay_range, test::util};
 use feldera_types::config::InputEndpointConfig;
 use feldera_types::secret_resolver::default_secrets_directory;
 use serde_json::json;
@@ -14,6 +13,12 @@ use std::time::Duration;
 /// Builds a NATS input config with `key: value` inserted at the transport
 /// config level, and runs it through configuration validation.
 fn validate_config_with(key: &str, value: serde_json::Value) -> Result<(), String> {
+    validate_config_at(&["transport", "config", key], value)
+}
+
+/// Like [validate_config_with], with `value` at any `path` of the endpoint
+/// configuration.
+fn validate_config_at(path: &[&str], value: serde_json::Value) -> Result<(), String> {
     let mut config = json!({
         "stream": "test_input",
         "transport": {
@@ -35,7 +40,12 @@ fn validate_config_with(key: &str, value: serde_json::Value) -> Result<(), Strin
             },
         },
     });
-    config["transport"]["config"][key] = value;
+    let (last, parents) = path.split_last().unwrap();
+    let mut target = &mut config;
+    for key in parents {
+        target = &mut target[*key];
+    }
+    target[*last] = value;
 
     let config: InputEndpointConfig = serde_json::from_value(config).unwrap();
     input_transport_config_to_endpoint(
@@ -94,196 +104,221 @@ fn test_nats_retry_interval_below_one_second_rejected() {
     }
 }
 
+/// Configuration mistakes that no server can fix fail when the connector
+/// opens, instead of turning into retries without end.
+#[test]
+fn test_nats_permanent_config_errors_rejected_at_open() {
+    for (path, value, needle) in [
+        (
+            &["transport", "config", "consumer_config", "rate_limit"][..],
+            json!(1000),
+            "`rate_limit` is 1000",
+        ),
+        (
+            &["transport", "config", "stream_name"][..],
+            json!("orders.eu"),
+            "contains '.'",
+        ),
+        (
+            &["transport", "config", "stream_name"][..],
+            json!(""),
+            "`stream_name` is empty",
+        ),
+        (
+            &["transport", "config", "consumer_config", "filter_subjects"][..],
+            json!(["orders.>.eu"]),
+            "uses `>` before the last token",
+        ),
+        (
+            &["transport", "config", "consumer_config", "filter_subjects"][..],
+            json!(["orders..eu"]),
+            "has an empty token",
+        ),
+        (
+            &["transport", "config", "consumer_config", "filter_subjects"][..],
+            json!(["orders.e*"]),
+            "uses a wildcard inside a token",
+        ),
+        (
+            &["transport", "config", "consumer_config", "deliver_policy"][..],
+            json!("LastPerSubject"),
+            "`LastPerSubject` needs `filter_subjects`",
+        ),
+        (
+            &["transport", "config", "connection_config", "auth"][..],
+            json!({"token": "t", "user_and_password": {"user": "u", "password": "p"}}),
+            "multiple NATS authentication methods",
+        ),
+        (
+            &["transport", "config", "connection_config", "auth"][..],
+            json!({"jwt": "eyJ0eXAiOiJKV1QifQ"}),
+            "requires `nkey`",
+        ),
+        (
+            &["transport", "config", "connection_config", "auth"][..],
+            json!({"nkey": "SUNOTASEED"}),
+            "invalid NATS nkey seed",
+        ),
+    ] {
+        let error = validate_config_at(path, value.clone())
+            .expect_err(&format!("{path:?} = {value} must be rejected"));
+        assert!(error.contains(needle), "{path:?} = {value}: {error}");
+    }
+
+    // Valid subjects and names pass.
+    validate_config_at(
+        &["transport", "config", "consumer_config", "filter_subjects"],
+        json!(["orders.*.eu", "orders.us.>", "x"]),
+    )
+    .unwrap();
+    validate_config_at(
+        &["transport", "config", "stream_name"],
+        json!("ORDERS-v2_x"),
+    )
+    .unwrap();
+}
+
 // ---------------------------------------------------------------------------
-// Validation Error Classification
+// Validation of stream positions
 // ---------------------------------------------------------------------------
-//
-// These tests verify that `validate_resume_position` and `validate_replay_range`
-// classify errors correctly:
-//   - Transient I/O errors (server down) → ConnectorError::Retryable
-//   - Logical failures (out of bounds)   → ConnectorError::Fatal
-//   - Valid inputs                        → Ok
 
-const STREAM: &str = "validation_test_stream";
-const SUBJECT: &str = "validation_test_subject";
-
-/// Lightweight test harness for validation functions.
-///
-/// Manages a NATS server, JetStream context, and tokio runtime. The context
-/// is created once during `start()` and survives `kill_server()`, so tests
-/// can verify behavior against a dead server.
-struct NatsTestFixture {
-    _guard: Option<util::ProcessKillGuard>,
-    js: jetstream::Context,
-    rt: tokio::runtime::Runtime,
-}
-
-impl NatsTestFixture {
-    /// Start a NATS server, create the test stream, and connect a JetStream context.
-    fn start() -> Self {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let (guard, url) = util::start_nats_and_get_address().unwrap();
-        let js = rt.block_on(async {
-            util::create_stream(&url, STREAM, SUBJECT).await.unwrap();
-            let client = util::wait_for_nats_ready(&url, Duration::from_secs(5))
-                .await
-                .unwrap();
-            jetstream::new(client)
-        });
-        Self {
-            _guard: Some(guard),
-            js,
-            rt,
-        }
-    }
-
-    /// Publish `n` dummy JSON messages to the test subject.
-    fn publish(&self, n: usize) {
-        let msgs: Vec<_> = (0..n).map(|i| serde_json::json!({"x": i})).collect();
-        self.rt.block_on(async {
-            for msg in &msgs {
-                let ack = self
-                    .js
-                    .publish(
-                        SUBJECT.to_string(),
-                        serde_json::to_string(msg).unwrap().into(),
-                    )
-                    .await
-                    .unwrap();
-                ack.await.unwrap();
-            }
-        });
-    }
-
-    /// Purge all messages from the test stream.
-    fn purge(&self) {
-        self.rt.block_on(async {
-            let stream = self.js.get_stream(STREAM).await.unwrap();
-            stream.purge().await.unwrap();
-        });
-    }
-
-    /// Kill the NATS server. The JetStream context remains usable for
-    /// testing — subsequent operations will fail with transient I/O errors.
-    fn kill_server(&mut self) {
-        self._guard.take();
-        std::thread::sleep(Duration::from_millis(200));
+fn stream(messages: u64, first_sequence: u64, last_sequence: u64) -> StreamState {
+    StreamState {
+        messages,
+        first_sequence,
+        last_sequence,
     }
 }
 
-fn validate_resume(nats: &NatsTestFixture, cursor: u64) -> Result<(), ConnectorError> {
-    nats.rt.block_on(super::super::validate_resume_position(
-        &nats.js, STREAM, cursor,
-    ))
+fn is_fatal(result: Result<(), ConnectorError>) -> bool {
+    matches!(result, Err(ConnectorError::Fatal(_)))
 }
 
-fn validate_replay(
-    nats: &NatsTestFixture,
-    range: std::ops::Range<u64>,
-) -> Result<(), ConnectorError> {
-    nats.rt.block_on(super::super::validate_replay_range(
-        &nats.js, STREAM, &range,
-    ))
+/// A fresh start (resume cursor 0) needs no validation.
+#[test]
+fn test_nats_validate_resume_fresh_start_is_ok() {
+    assert!(validate_resume_position(&stream(0, 0, 0), "s", false, 0).is_ok());
+    assert!(validate_resume_position(&stream(3, 5, 7), "s", false, 0).is_ok());
 }
-
-// -- Resume validation --
 
 #[test]
-fn test_nats_validate_resume_server_down_is_retryable() {
-    let mut nats = NatsTestFixture::start();
-    nats.publish(1);
-    nats.kill_server();
-    assert!(matches!(
-        validate_resume(&nats, 1),
-        Err(ConnectorError::Retryable(_))
-    ));
+fn test_nats_validate_resume_within_and_at_tail_is_ok() {
+    // Messages 1..=3: resume at 1, 3, or the next message 4.
+    for cursor in [1, 3, 4] {
+        assert!(validate_resume_position(&stream(3, 1, 3), "s", false, cursor).is_ok());
+    }
+    // Interior deletes leave first and last in place.
+    assert!(validate_resume_position(&stream(2, 1, 3), "s", false, 2).is_ok());
+}
+
+/// A stream whose already-read messages all expired, or were purged, is
+/// empty but continues at `last + 1`. Resuming there loses nothing.
+#[test]
+fn test_nats_validate_resume_after_consumed_history_removed_is_ok() {
+    // Purged after 5 messages: first = 6, last = 5.
+    assert!(validate_resume_position(&stream(0, 6, 5), "s", false, 6).is_ok());
+    // A new stream that has never had a message.
+    assert!(validate_resume_position(&stream(0, 0, 0), "s", false, 1).is_ok());
 }
 
 #[test]
 fn test_nats_validate_resume_before_head_is_fatal() {
-    let nats = NatsTestFixture::start();
-    nats.publish(5);
-    nats.purge();
-    nats.publish(3);
-    // Stream first_sequence is now 6; cursor 2 is before that.
-    assert!(matches!(
-        validate_resume(&nats, 2),
-        Err(ConnectorError::Fatal(_))
-    ));
+    // Messages 1..=5 purged, 6..=8 published: 2..=5 were never read.
+    assert!(is_fatal(validate_resume_position(
+        &stream(3, 6, 8),
+        "s",
+        false,
+        2
+    )));
+    // Messages 3..=5 purged before the connector read them.
+    assert!(is_fatal(validate_resume_position(
+        &stream(0, 6, 5),
+        "s",
+        false,
+        3
+    )));
 }
 
 #[test]
 fn test_nats_validate_resume_with_gap_from_tail_is_fatal() {
-    let nats = NatsTestFixture::start();
-    nats.publish(3);
-    // Message 1,2,3 in stream, try resume from 5, so a gap.
-    assert!(matches!(
-        validate_resume(&nats, 5),
-        Err(ConnectorError::Fatal(_))
-    ));
-}
-
-/// A fresh start (resume_cursor=0) do not need any stream seqeunce validation
-/// and should succeeds on an empty stream.
-#[test]
-fn test_nats_validate_resume_fresh_start_is_ok() {
-    let nats = NatsTestFixture::start();
-    assert!(validate_resume(&nats, 0).is_ok());
-}
-
-#[test]
-fn test_nats_validate_resume_continue_is_ok() {
-    let nats = NatsTestFixture::start();
-    nats.publish(3);
-    assert!(validate_resume(&nats, 3).is_ok());
-}
-
-// -- Replay validation --
-
-#[test]
-fn test_nats_validate_replay_server_down_is_retryable() {
-    let mut nats = NatsTestFixture::start();
-    nats.publish(1);
-    nats.kill_server();
-    assert!(matches!(
-        validate_replay(&nats, 1..2),
-        Err(ConnectorError::Retryable(_))
-    ));
+    // Messages 1..=3, resume from 5: the stream lost messages already read.
+    assert!(is_fatal(validate_resume_position(
+        &stream(3, 1, 3),
+        "s",
+        false,
+        5
+    )));
+    // The same against an empty, recreated stream.
+    assert!(is_fatal(validate_resume_position(
+        &stream(0, 0, 0),
+        "s",
+        false,
+        6
+    )));
 }
 
 #[test]
 fn test_nats_validate_replay_range_exceeds_tail_is_fatal() {
-    let nats = NatsTestFixture::start();
-    nats.publish(3);
-    // last_sequence=3; requesting [1, 100) exceeds tail.
-    assert!(matches!(
-        validate_replay(&nats, 1..100),
-        Err(ConnectorError::Fatal(_))
-    ));
+    assert!(is_fatal(validate_replay_range(
+        &stream(3, 1, 3),
+        "s",
+        &(1..100)
+    )));
 }
 
 #[test]
 fn test_nats_validate_replay_range_precedes_head_is_fatal() {
-    let nats = NatsTestFixture::start();
-    nats.publish(3);
-    nats.purge();
-    nats.publish(4);
-    // Sequence in stream 4,5,6,7. Missing 1,2,3.
-    assert!(matches!(
-        validate_replay(&nats, 1..8),
-        Err(ConnectorError::Fatal(_))
-    ));
+    // Messages 4..=7: 1..=3 are gone.
+    assert!(is_fatal(validate_replay_range(
+        &stream(4, 4, 7),
+        "s",
+        &(1..8)
+    )));
+}
+
+#[test]
+fn test_nats_validate_replay_empty_stream_is_fatal() {
+    assert!(is_fatal(validate_replay_range(
+        &stream(0, 6, 5),
+        "s",
+        &(1..6)
+    )));
 }
 
 #[test]
 fn test_nats_validate_replay_empty_range_is_ok() {
-    let nats = NatsTestFixture::start();
-    assert!(validate_replay(&nats, 5..5).is_ok());
+    assert!(validate_replay_range(&stream(0, 0, 0), "s", &(5..5)).is_ok());
 }
 
 #[test]
 fn test_nats_validate_replay_range_is_ok() {
-    let nats = NatsTestFixture::start();
-    nats.publish(6);
-    assert!(validate_replay(&nats, 3..7).is_ok());
+    assert!(validate_replay_range(&stream(6, 1, 6), "s", &(3..7)).is_ok());
+    assert!(validate_replay_range(&stream(6, 1, 6), "s", &(1..2)).is_ok());
+}
+
+/// Failing to reach the server is worth retrying; it says nothing about the
+/// stream.
+#[test]
+fn test_nats_stream_info_server_down_is_retryable() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (guard, url) = util::start_nats_and_get_address().unwrap();
+    let js = rt.block_on(async {
+        util::create_stream(&url, "s", "sub").await.unwrap();
+        let client = util::wait_for_nats_ready(&url, Duration::from_secs(5))
+            .await
+            .unwrap();
+        let mut js = async_nats::jetstream::new(client);
+        js.set_timeout(Duration::from_secs(1));
+        js
+    });
+    assert!(
+        rt.block_on(super::super::fetch_stream_info(&js, "s"))
+            .is_ok()
+    );
+    drop(guard);
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(matches!(
+        rt.block_on(super::super::fetch_stream_info(&js, "s")),
+        Err(ConnectorError::Retryable(_))
+    ));
 }

@@ -131,9 +131,12 @@ enum PublishFailure {
 /// visible in the logs.
 fn classify(error: jetstream::context::PublishError) -> PublishFailure {
     match error.kind() {
+        // async-nats checks the size against the server's `max_payload`
+        // before sending; the same message is too large on every attempt.
         PublishErrorKind::StreamNotFound
         | PublishErrorKind::WrongLastMessageId
-        | PublishErrorKind::WrongLastSequence => PublishFailure::Permanent(error.into()),
+        | PublishErrorKind::WrongLastSequence
+        | PublishErrorKind::MaxPayloadExceeded => PublishFailure::Permanent(error.into()),
         PublishErrorKind::TimedOut
         | PublishErrorKind::BrokenPipe
         | PublishErrorKind::MaxAckPending
@@ -159,10 +162,10 @@ impl NatsOutputConnection {
         publish_timeout: Duration,
         shutdown: &CancellationToken,
     ) -> AnyResult<()> {
-        // A payload over the limit is not rejected before it reaches the wire
-        // on the JetStream publish path: the server's refusal comes back as an
-        // ack failure of kind `Other`. Check up front and fail with the limit
-        // named instead.
+        // The client rejects only a message over the server's `max_payload`
+        // before it reaches the wire; the stream's refusal of a message over
+        // its own `max_message_size` comes back as an ack failure of kind
+        // `Other`. Check up front and fail with the limit named instead.
         if payload.len() > self.max_payload_bytes() {
             bail!(
                 "NATS output: payload of {} bytes exceeds the message size limit of {} bytes (subject '{subject}'). Raise the stream's max_message_size, configure the connector's max_message_size, or split the record.",
