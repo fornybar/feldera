@@ -10,6 +10,24 @@ Source edition can be found on github.
 
 ## Unreleased
 
+- Bug fixes and incompatible changes (NATS input connector): fault tolerance
+  is reworked; see [NATS input connector](/connectors/sources/nats).
+  - Replay reads journaled steps back by stream sequence with batched Direct
+    Get (or from the stream leader) instead of through a consumer. It feeds
+    exactly the step's messages, with the journaled record counts, and fails
+    instead of waiting forever when a message of the step was deleted.
+  - The connector reads with its own pull consumer instead of the client
+    library's ordered consumer, which could restart a consumer from the
+    beginning of the stream and ingest it twice.
+  - A stream that was deleted and recreated under the same name is detected.
+  - `New` and `Last` no longer skip messages published while the connector
+    was paused, and `LastPerSubject` replays exactly its snapshot.
+  - Resuming after the messages that the pipeline already read expired or
+    were purged no longer fails.
+  - `rate_limit`, and `LastPerSubject` without `filter_subjects`, are now
+    rejected when the connector opens.
+  - New metric `input_connector_nats_replay_leader_fallbacks_total`.
+
 - Experimental (Enterprise, Kubernetes): a resize of `memory_max` with
   `PATCH /v0/pipelines/{name}` also changes the memory budget of the
   running pipeline, unless `max_rss` is set.  A smaller budget applies at
