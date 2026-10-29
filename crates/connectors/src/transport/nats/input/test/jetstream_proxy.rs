@@ -43,6 +43,11 @@ pub struct ProxyFaults {
     pub delay_deletes: Option<Duration>,
     /// Holds consumer deletes until the test calls `release_deletes()`.
     pub hold_deletes: bool,
+    /// Drops the nth message that a consumer delivers, as a connection
+    /// that loses it would.
+    pub drop_delivery: Option<usize>,
+    /// Drops the nth reply to a Direct Get request.
+    pub drop_direct_get_reply: Option<usize>,
 }
 
 /// State shared by all connections of one proxy.
@@ -61,6 +66,12 @@ struct ProxyState {
     /// Number of stream info replies still to drop. Set at run time with
     /// [`JetStreamProxy::drop_stream_info_replies`].
     stream_info_replies_to_drop: usize,
+    /// Consumer deliveries so far.
+    deliveries: usize,
+    /// Reply subjects of Direct Get requests.
+    direct_get_inboxes: HashSet<String>,
+    /// Direct Get replies so far.
+    direct_get_replies: usize,
 }
 
 pub struct JetStreamProxy {
@@ -182,6 +193,32 @@ impl Frame {
     }
 }
 
+/// Whether the proxy drops this message from the server.
+fn drop_reply(state: &Mutex<ProxyState>, frame: &Frame) -> bool {
+    let args = frame.args();
+    let subject = args[1];
+    let mut state = state.lock().unwrap();
+    if state.dropped_replies.remove(subject) {
+        return true;
+    }
+    // `MSG <subject> <sid> [reply] <size>`, and `HMSG` with one more size: a
+    // delivery's reply subject is its ack subject.
+    let with_reply = if frame.op() == "MSG" { 5 } else { 6 };
+    if args.len() == with_reply && args[3].starts_with("$JS.ACK.") {
+        state.deliveries += 1;
+        if state.faults.drop_delivery == Some(state.deliveries) {
+            return true;
+        }
+    }
+    if state.direct_get_inboxes.contains(subject) {
+        state.direct_get_replies += 1;
+        if state.faults.drop_direct_get_reply == Some(state.direct_get_replies) {
+            return true;
+        }
+    }
+    false
+}
+
 async fn read_frame<R: AsyncBufRead + Unpin>(reader: &mut R) -> io::Result<Option<Frame>> {
     let mut raw = Vec::new();
     if reader.read_until(b'\n', &mut raw).await? == 0 {
@@ -246,11 +283,8 @@ async fn proxy_connection(
         tokio::spawn(async move {
             let mut reader = BufReader::new(server_read);
             while let Ok(Some(frame)) = read_frame(&mut reader).await {
-                if matches!(frame.op().as_str(), "MSG" | "HMSG") {
-                    let subject = frame.args()[1].to_string();
-                    if state.lock().unwrap().dropped_replies.remove(&subject) {
-                        continue;
-                    }
+                if matches!(frame.op().as_str(), "MSG" | "HMSG") && drop_reply(&state, &frame) {
+                    continue;
                 }
                 if write_all(&client_write, &frame.bytes()).await.is_err() {
                     break;
@@ -325,6 +359,11 @@ async fn proxy_connection(
                         to_server.push(create);
                     }
                 } else {
+                    if subject.starts_with("$JS.API.DIRECT.GET.")
+                        && let Some(reply) = reply
+                    {
+                        state.direct_get_inboxes.insert(reply.to_string());
+                    }
                     if subject.starts_with("$JS.API.STREAM.INFO.") {
                         request_gate = state.stream_info_gate.clone();
                     }

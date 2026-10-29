@@ -1,8 +1,8 @@
 use anyhow::{Result as AnyResult, anyhow, bail};
-use async_nats::jetstream::consumer as nats;
+use async_nats::jetstream::{self, consumer as nats};
 use aws_lc_rs::signature::Ed25519KeyPair;
 use feldera_types::transport::nats as cfg;
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 /// Decodes a NATS seed ("SU..." for users) to the raw 32-byte Ed25519 seed.
 ///
@@ -84,23 +84,7 @@ async fn apply_auth(
     options: async_nats::ConnectOptions,
     auth: &cfg::Auth,
 ) -> AnyResult<async_nats::ConnectOptions> {
-    let configured = [
-        auth.credentials.is_some(),
-        auth.jwt.is_some(),
-        // A bare nkey is its own method; alongside jwt it is part of the
-        // jwt method (the seed signs the connection nonce).
-        auth.nkey.is_some() && auth.jwt.is_none(),
-        auth.token.is_some(),
-        auth.user_and_password.is_some(),
-    ]
-    .iter()
-    .filter(|&&set| set)
-    .count();
-    if configured > 1 {
-        bail!(
-            "multiple NATS authentication methods configured; set exactly one of `credentials`, `jwt` (with `nkey`), `nkey`, `token`, or `user_and_password`"
-        );
-    }
+    validate_auth(auth)?;
 
     if let Some(creds) = auth.credentials.as_ref() {
         return Ok(match creds {
@@ -147,23 +131,187 @@ async fn apply_auth(
     Ok(options)
 }
 
-pub fn translate_consumer_options(config: &cfg::ConsumerConfig) -> nats::pull::OrderedConfig {
-    nats::pull::OrderedConfig {
+/// How long the server keeps a consumer that nobody pulls from.
+///
+/// The connector deletes its consumers itself; this only bounds how long one
+/// outlives a process that died without cleaning up. A reading connector
+/// always has a pull request outstanding, so it never comes close.
+pub const CONSUMER_INACTIVE_THRESHOLD: Duration = Duration::from_secs(60);
+
+/// Builds the configuration of the consumers the connector reads with.
+///
+/// Every consumer is an ephemeral, single-replica, in-memory pull consumer
+/// without acknowledgments, like the client library's ordered consumer. The
+/// connector tracks the stream position itself and recreates the consumer at
+/// that position when it detects a gap, instead of letting the library do it
+/// behind its back (see the module documentation of `input`). The deliver
+/// policy is the configured one; the caller overrides it when it resumes.
+pub fn translate_consumer_options(config: &cfg::ConsumerConfig) -> nats::pull::Config {
+    nats::pull::Config {
         name: config.name.clone(),
         description: config.description.clone(),
-        filter_subject: Default::default(),
         filter_subjects: config.filter_subjects.clone(),
         replay_policy: translate_replay_policy(&config.replay_policy),
         rate_limit: config.rate_limit,
-        sample_frequency: Default::default(),
-        headers_only: false,
         deliver_policy: translate_deliver_policy(&config.deliver_policy),
+        ack_policy: nats::AckPolicy::None,
         max_waiting: config.max_waiting,
         metadata: config.metadata.clone(),
         max_batch: config.max_batch.unwrap_or_default(),
         max_bytes: config.max_bytes.unwrap_or_default(),
         max_expires: config.max_expiry.map(Into::into).unwrap_or_default(),
+        inactive_threshold: CONSUMER_INACTIVE_THRESHOLD,
+        num_replicas: 1,
+        memory_storage: true,
+        ..Default::default()
     }
+}
+
+/// Checks the parts of the configuration that no server can fix, so that a
+/// mistake fails the connector when it opens instead of retrying forever.
+pub fn validate_input_config(config: &cfg::NatsInputConfig) -> AnyResult<()> {
+    validate_stream_name(&config.stream_name)?;
+    for filter in &config.consumer_config.filter_subjects {
+        validate_subject(filter).map_err(|error| {
+            anyhow!("Invalid NATS input configuration: filter subject {filter:?} {error}")
+        })?;
+    }
+    if matches!(
+        config.consumer_config.deliver_policy,
+        cfg::DeliverPolicy::LastPerSubject
+    ) && config.consumer_config.filter_subjects.is_empty()
+    {
+        bail!(
+            "Invalid NATS input configuration: `deliver_policy` `LastPerSubject` needs `filter_subjects`, because NATS delivers the last message per subject only for a consumer whose filter subject is set; add `filter_subjects`, for example `[\">\"]` for every subject"
+        );
+    }
+    if config.consumer_config.rate_limit != 0 {
+        bail!(
+            "Invalid NATS input configuration: `rate_limit` is {}, but the connector reads with a pull consumer and NATS supports a rate limit only on push consumers; remove `rate_limit`",
+            config.consumer_config.rate_limit
+        );
+    }
+    validate_auth(&config.connection_config.auth)?;
+    Ok(())
+}
+
+/// JetStream stream names may not be empty and may not contain whitespace,
+/// `.`, `*`, `>`, `/` or `\`.
+fn validate_stream_name(name: &str) -> AnyResult<()> {
+    if name.is_empty() {
+        bail!("Invalid NATS input configuration: `stream_name` is empty");
+    }
+    if let Some(c) = name
+        .chars()
+        .find(|c| c.is_whitespace() || matches!(c, '.' | '*' | '>' | '/' | '\\'))
+    {
+        bail!(
+            "Invalid NATS input configuration: `stream_name` {name:?} contains {c:?}, which JetStream does not allow in a stream name"
+        );
+    }
+    Ok(())
+}
+
+/// A subject filter is a non-empty sequence of non-empty `.`-separated tokens
+/// without whitespace, where `*` and `>` are only whole tokens and `>` only
+/// the last one.
+fn validate_subject(subject: &str) -> Result<(), &'static str> {
+    if subject.is_empty() {
+        return Err("is empty");
+    }
+    if subject.chars().any(char::is_whitespace) {
+        return Err("contains whitespace");
+    }
+    let tokens: Vec<&str> = subject.split('.').collect();
+    for (i, token) in tokens.iter().enumerate() {
+        if token.is_empty() {
+            return Err("has an empty token");
+        }
+        if token.len() > 1 && (token.contains('*') || token.contains('>')) {
+            return Err("uses a wildcard inside a token");
+        }
+        if *token == ">" && i + 1 != tokens.len() {
+            return Err("uses `>` before the last token");
+        }
+    }
+    Ok(())
+}
+
+/// The authentication checks of [apply_auth] that need no I/O.
+fn validate_auth(auth: &cfg::Auth) -> AnyResult<()> {
+    let configured = [
+        auth.credentials.is_some(),
+        auth.jwt.is_some(),
+        // A bare nkey is its own method; alongside jwt it is part of the
+        // jwt method (the seed signs the connection nonce).
+        auth.nkey.is_some() && auth.jwt.is_none(),
+        auth.token.is_some(),
+        auth.user_and_password.is_some(),
+    ]
+    .iter()
+    .filter(|&&set| set)
+    .count();
+    if configured > 1 {
+        bail!(
+            "multiple NATS authentication methods configured; set exactly one of `credentials`, `jwt` (with `nkey`), `nkey`, `token`, or `user_and_password`"
+        );
+    }
+    if auth.jwt.is_some() && auth.nkey.is_none() {
+        bail!(
+            "NATS `jwt` authentication requires `nkey` (the seed that signs the connection nonce)"
+        );
+    }
+    if let Some(seed) = auth.nkey.as_ref() {
+        decode_seed(seed)?;
+    }
+    Ok(())
+}
+
+/// Hides the user information (`user:password@` or `token@`) of every URL in
+/// a NATS server URL list, for logs and error messages.
+pub fn redact_server_url(url: &str) -> String {
+    url.split(',')
+        .map(|url| {
+            let (scheme, rest) = match url.split_once("://") {
+                Some((scheme, rest)) => (Some(scheme), rest),
+                None => (None, url),
+            };
+            let authority_end = rest.find('/').unwrap_or(rest.len());
+            let rest = match rest[..authority_end].rfind('@') {
+                Some(at) => format!("***@{}", &rest[at + 1..]),
+                None => rest.to_string(),
+            };
+            match scheme {
+                Some(scheme) => format!("{scheme}://{rest}"),
+                None => rest,
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Whether a JetStream API error is permanent: the server rejected the
+/// request itself, so it will reject it again however often it is repeated.
+///
+/// JetStream reports a malformed or inconsistent request (an invalid
+/// consumer configuration, a filter that does not match the stream, ...) as
+/// a 400. Exhausted resources are 400s too, but those clear once other
+/// consumers go away, and a name collision clears with the next attempt's
+/// fresh name; they and every other status (404 for a stream that does not
+/// exist yet, 5xx for an unavailable cluster) are worth retrying.
+pub fn is_permanent_api_error(error: &jetstream::Error) -> bool {
+    use jetstream::ErrorCode;
+    const RETRYABLE: [ErrorCode; 8] = [
+        ErrorCode::ACCOUNT_RESOURCES_EXCEEDED,
+        ErrorCode::INSUFFICIENT_RESOURCES,
+        ErrorCode::MAXIMUM_CONSUMERS_LIMIT,
+        ErrorCode::MEMORY_RESOURCES_EXCEEDED,
+        ErrorCode::STORAGE_RESOURCES_EXCEEDED,
+        ErrorCode::CONSUMER_NAME_EXIST,
+        ErrorCode::CONSUMER_ALREADY_EXISTS,
+        ErrorCode::CONSUMER_EXISTING_ACTIVE,
+    ];
+    error.code() == 400 && !RETRYABLE.contains(&error.error_code())
 }
 
 fn translate_replay_policy(p: &cfg::ReplayPolicy) -> nats::ReplayPolicy {

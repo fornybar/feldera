@@ -10,6 +10,7 @@ mod custom_tests;
 pub mod hardening_tests;
 pub mod jetstream_proxy;
 pub mod mock_tests;
+pub mod replay_tests;
 
 #[cfg(any(test, feature = "testing"))]
 pub mod util {
@@ -50,8 +51,9 @@ pub mod util {
     pub struct ProcessKillGuard {
         process: Child,
         /// Holds the JetStream store, the ports file, and the server log.
-        /// Deleted after `process` has been killed and reaped.
-        _scratch: TempDir,
+        /// Deleted after `process` has been killed and reaped, unless
+        /// [Self::kill_keeping_store] hands it on to a restarted server.
+        scratch: Option<TempDir>,
         /// Read only by the tests of this module, which check that no two servers share it.
         #[cfg_attr(not(test), allow(dead_code))]
         store_dir: PathBuf,
@@ -110,6 +112,20 @@ pub mod util {
             self.signal("CONT")
         }
 
+        /// Kills the server (SIGKILL, as a crash would) but keeps its
+        /// JetStream store, for [`start_nats_on_port_with_store`]: file-backed
+        /// streams survive a restart with their messages and creation time,
+        /// as they do on a real server.
+        pub fn kill_keeping_store(mut self) -> NatsStore {
+            let _ = self.process.kill();
+            let _ = self.process.wait();
+            NatsStore(
+                self.scratch
+                    .take()
+                    .expect("the scratch directory is only taken here"),
+            )
+        }
+
         fn signal(&self, signal: &str) -> AnyResult<()> {
             let status = Command::new("kill")
                 .arg(format!("-{signal}"))
@@ -121,6 +137,10 @@ pub mod util {
             Ok(())
         }
     }
+
+    /// The JetStream store of a killed server; see
+    /// [`ProcessKillGuard::kill_keeping_store`].
+    pub struct NatsStore(TempDir);
 
     impl Drop for ProcessKillGuard {
         fn drop(&mut self) {
@@ -150,10 +170,17 @@ pub mod util {
     /// operating system choose one. `extra_args` are appended to the command
     /// line (e.g. authorization flags). Returns the guard and the bound
     /// address.
-    fn spawn_nats_server(port: &str, extra_args: &[&str]) -> AnyResult<(ProcessKillGuard, String)> {
+    fn spawn_nats_server(
+        port: &str,
+        extra_args: &[&str],
+        store: Option<NatsStore>,
+    ) -> AnyResult<(ProcessKillGuard, String)> {
         let nats_ip_addr = "127.0.0.1";
 
-        let scratch = TempDir::new()?;
+        let scratch = match store {
+            Some(NatsStore(scratch)) => scratch,
+            None => TempDir::new()?,
+        };
         let store_dir = scratch.path().join("jetstream");
         let ports_file_dir = scratch.path().join("ports");
         let log_path = scratch.path().join("nats-server.log");
@@ -179,7 +206,7 @@ pub mod util {
         let ports_file = ports_file_dir.join(format!("nats-server_{}.ports", process.id()));
         let mut guard = ProcessKillGuard {
             process,
-            _scratch: scratch,
+            scratch: Some(scratch),
             store_dir,
             ports_file,
             log_path,
@@ -202,7 +229,7 @@ pub mod util {
 
         let mut last_error: Option<anyhow::Error> = None;
         for attempt in 1..=MAX_ATTEMPTS {
-            match spawn_nats_server(RANDOM_PORT, extra_args) {
+            match spawn_nats_server(RANDOM_PORT, extra_args, None) {
                 Ok(result) => return Ok(result),
                 Err(error) => {
                     last_error = Some(error);
@@ -217,14 +244,18 @@ pub mod util {
     }
 
     /// Start a server on a specific port, as tests do when restarting a killed
-    /// server at the address its connector is configured with.
+    /// server at the address its connector is configured with, on the
+    /// JetStream store of a killed server if `store` is set.
     ///
     /// Fails if the port is no longer available. Nothing reserves the port while
     /// the server is down, so an unrelated process may take it; failing here
     /// reports that directly instead of letting a later action time out against
     /// a foreign server.
-    pub fn start_nats_on_port(port: u16) -> AnyResult<(ProcessKillGuard, String)> {
-        let (guard, addr) = spawn_nats_server(&port.to_string(), &[])
+    pub fn start_nats_on_port_with_store(
+        port: u16,
+        store: Option<NatsStore>,
+    ) -> AnyResult<(ProcessKillGuard, String)> {
+        let (guard, addr) = spawn_nats_server(&port.to_string(), &[], store)
             .map_err(|e| e.context(format!("failed to restart nats-server on port {port}")))?;
 
         if !addr.ends_with(&format!(":{port}")) {
@@ -249,15 +280,57 @@ pub mod util {
     }
 
     pub async fn create_stream(nats_url: &str, stream: &str, subject: &str) -> AnyResult<()> {
+        create_stream_with(nats_url, stream_config(stream, &[subject], true)).await
+    }
+
+    /// The configuration of a test stream with `subjects`.
+    pub fn stream_config(
+        stream: &str,
+        subjects: &[&str],
+        allow_direct: bool,
+    ) -> jetstream::stream::Config {
+        jetstream::stream::Config {
+            name: stream.to_string(),
+            subjects: subjects.iter().map(|subject| subject.to_string()).collect(),
+            // File storage, so that the stream survives a server restart
+            // (see `ProcessKillGuard::kill_keeping_store`).
+            storage: jetstream::stream::StorageType::File,
+            // What `nats stream add` sets by default, unlike the client
+            // library: replay reads with Direct Get only with it.
+            allow_direct,
+            ..Default::default()
+        }
+    }
+
+    pub async fn create_stream_with(
+        nats_url: &str,
+        config: jetstream::stream::Config,
+    ) -> AnyResult<()> {
+        let client = wait_for_nats_ready(nats_url, Duration::from_secs(5)).await?;
+        jetstream::new(client).create_stream(config).await?;
+        Ok(())
+    }
+
+    /// Publishes each of `payloads` as one message, as is.
+    pub async fn publish_raw(nats_url: &str, subject: &str, payloads: &[String]) -> AnyResult<()> {
         let client = wait_for_nats_ready(nats_url, Duration::from_secs(5)).await?;
         let js = jetstream::new(client);
-        js.create_stream(jetstream::stream::Config {
-            name: stream.to_string(),
-            subjects: vec![subject.to_string()],
-            storage: jetstream::stream::StorageType::Memory,
-            ..Default::default()
-        })
-        .await?;
+        for payload in payloads {
+            js.publish(subject.to_string(), payload.clone().into())
+                .await?
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Deletes the message with stream sequence `sequence`.
+    pub async fn delete_message(nats_url: &str, stream: &str, sequence: u64) -> AnyResult<()> {
+        let client = wait_for_nats_ready(nats_url, Duration::from_secs(5)).await?;
+        jetstream::new(client)
+            .get_stream_no_info(stream)
+            .await?
+            .delete_message(sequence)
+            .await?;
         Ok(())
     }
 
@@ -337,7 +410,7 @@ pub mod util {
             let (_holder, addr) = start_nats_and_get_address().unwrap();
             let port: u16 = addr.rsplit_once(':').unwrap().1.parse().unwrap();
 
-            let error = start_nats_on_port(port)
+            let error = start_nats_on_port_with_store(port, None)
                 .err()
                 .expect("starting a second server on a taken port must fail");
             let text = format!("{error:#}");
