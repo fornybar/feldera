@@ -131,9 +131,12 @@ enum PublishFailure {
 /// visible in the logs.
 fn classify(error: jetstream::context::PublishError) -> PublishFailure {
     match error.kind() {
+        // async-nats checks the size against the server's `max_payload`
+        // before sending; the same message is too large on every attempt.
         PublishErrorKind::StreamNotFound
         | PublishErrorKind::WrongLastMessageId
-        | PublishErrorKind::WrongLastSequence => PublishFailure::Permanent(error.into()),
+        | PublishErrorKind::WrongLastSequence
+        | PublishErrorKind::MaxPayloadExceeded => PublishFailure::Permanent(error.into()),
         PublishErrorKind::TimedOut
         | PublishErrorKind::BrokenPipe
         | PublishErrorKind::MaxAckPending
