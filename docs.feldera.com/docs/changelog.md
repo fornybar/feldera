@@ -58,6 +58,17 @@ Source edition can be found on github.
     message, which is slower, and the connector logs a warning.
   - New metric `input_connector_nats_replay_leader_fallbacks_total`.
 
+- NATS input and output connectors: the NATS client library `async-nats` is
+  upgraded from 0.47 to 0.51.
+  - Bug fix (NATS output connector): a message larger than the NATS server's
+    `max_payload` used to be sent, and the connector then waited for an
+    acknowledgment that never came and retried forever. The client library
+    now rejects such a message before sending it, and the connector reports
+    the error ("max payload size exceeded") at once. This only happens when the
+    connector's `max_message_size` is set above the server's `max_payload`;
+    otherwise the connector's own size check rejects the message first.
+    Remove `max_message_size` or lower it to the server's limit.
+
 - Experimental (Enterprise, Kubernetes): a resize of `memory_max` with
   `PATCH /v0/pipelines/{name}` also changes the memory budget of the
   running pipeline, unless `max_rss` is set.  A smaller budget applies at

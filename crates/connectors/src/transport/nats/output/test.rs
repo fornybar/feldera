@@ -498,6 +498,54 @@ fn test_nats_output_max_message_size_override() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A `max_message_size` override above the server's `max_payload` lets a
+/// message through the connector's own size check. The client then rejects
+/// it before sending, and the connector fails the publish at once instead of
+/// waiting for an acknowledgment that never comes and retrying forever.
+#[test]
+fn test_nats_output_payload_over_server_max_payload_fails() -> anyhow::Result<()> {
+    init_test_logger();
+
+    let rt = tokio::runtime::Runtime::new()?;
+    let conf_dir = tempfile::tempdir()?;
+    let conf = conf_dir.path().join("nats.conf");
+    std::fs::write(&conf, "max_payload: 1024\n")?;
+    let (guard, addr) = input_util::start_nats_with_args(&["-c", conf.to_str().unwrap()])?;
+    let _guard = guard;
+    rt.block_on(input_util::create_stream(&addr, "str", "sub"))?;
+
+    let config = config_from_value(json!({
+        "connection_config": {
+            "server_url": addr,
+        },
+        "subject": "sub",
+        "max_message_size": 4096,
+    }));
+
+    use feldera_adapterlib::transport::OutputEndpoint;
+    let mut endpoint = NatsOutputEndpoint::new(config, CancellationToken::new())?;
+    endpoint.connect(Box::new(|_fatal, _error, _tag| {}))?;
+
+    let large = format!(
+        r#"{{"insert":{{"id":1,"b":true,"s":"{}"}}}}"#,
+        "x".repeat(2000)
+    );
+    endpoint.batch_start(0, OutputBatchType::Delta)?;
+    let started = std::time::Instant::now();
+    let error = endpoint.push_buffer(large.as_bytes()).unwrap_err();
+    let text = format!("{error:#}");
+    assert!(
+        text.contains("rejected the publish") && text.contains("max payload"),
+        "error should report the server's payload limit, got: {text}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "the publish should fail at once, not after retries; took {:?}",
+        started.elapsed()
+    );
+    Ok(())
+}
+
 /// The full pipeline with the default json output format and message ids:
 /// records flow through the encoder and the endpoint to the stream bound to
 /// the subject, and every message carries a `Nats-Msg-Id` header the

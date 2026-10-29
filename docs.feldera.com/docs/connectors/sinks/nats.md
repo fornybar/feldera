@@ -89,7 +89,10 @@ would surface only as an opaque publish failure.
 
 The limit is discovered at connect time — the bound stream's
 `max_message_size` when the stream sets one, else the server's max payload —
-and can be overridden with the connector's `max_message_size`.
+and can be overridden with the connector's `max_message_size`. An override
+above the server's max payload lets larger messages past this check, but the
+NATS client then rejects them with "max payload size exceeded", and the
+connector reports that error without retrying.
 
 ## Idempotence
 
