@@ -120,6 +120,9 @@ struct StreamContext {
     /// See [`consumer_name_prefix`].
     consumer_name_prefix: String,
     metrics: Arc<NatsInputMetrics>,
+    /// Whether the connector has checked, since it opened, that replay can
+    /// use batched Direct Get; see [replay::warn_once_without_direct_get].
+    direct_get_checked: Arc<AtomicBool>,
 }
 
 /// Upper bound on how long teardown waits for the server to acknowledge a
@@ -527,6 +530,7 @@ impl NatsReader {
             request_timeout: config.connection_config.request_timeout().into(),
             consumer_name_prefix,
             metrics: metrics.clone(),
+            direct_get_checked: Arc::new(AtomicBool::new(false)),
         };
         let mut retry = Retry {
             policy: RetryPolicy::new(
@@ -994,6 +998,7 @@ async fn start_reader(
         })?;
         let info = fetch_stream_info(&jetstream, &ctx.stream_name).await?;
         check_stream_identity(&mut stream_created, &info, &ctx.stream_name)?;
+        replay::warn_once_without_direct_get(&ctx, &jetstream, &info);
         if info.config.retention != RetentionPolicy::Limits {
             warn!(
                 "Stream '{}' has {:?} retention: the server may discard a message as soon as the connector has read it, before a checkpoint covers it, and then the pipeline cannot replay it after a failure; exactly-once fault tolerance needs Limits retention",

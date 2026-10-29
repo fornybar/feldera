@@ -33,12 +33,17 @@ use async_nats::{
     jetstream::{
         self,
         message::StreamMessage,
-        stream::{LastRawMessageErrorKind, Stream},
+        stream::{self as nats_stream, LastRawMessageErrorKind, Stream},
     },
 };
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
-use std::{collections::VecDeque, ops::Range, time::Duration};
+use std::{
+    collections::VecDeque,
+    ops::Range,
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
+};
 use tracing::{debug, warn};
 
 /// Most messages one Direct Get batch request asks for.
@@ -94,7 +99,7 @@ impl ReplaySource {
             stream_name: ctx.stream_name.clone(),
             subjects: read_subjects(ctx),
             timeout: ctx.request_timeout,
-            server_batches: version_at_least(&version, (2, 11)),
+            server_batches: version_at_least(&version, DIRECT_BATCH_VERSION),
         })
     }
 
@@ -114,6 +119,7 @@ impl ReplaySource {
             check_stream_identity(&mut Some(recorded.clone()), &info, &self.stream_name)?;
         }
         check_stream_identity(stream_created, &info, &self.stream_name)?;
+        warn_once_without_direct_get(ctx, &self.jetstream, &info);
         validate_replay_range(&StreamState::from(&info), &self.stream_name, range)?;
         let direct = self.server_batches && info.config.allow_direct;
 
@@ -616,16 +622,75 @@ pub(super) fn validate_replay_range(
     Ok(())
 }
 
-/// Whether a `nats-server` version string is at least `major.minor`.
-fn version_at_least(version: &str, (major, minor): (u64, u64)) -> bool {
+/// Logs a warning, the first time the connector sees the stream after it
+/// opened, if replay cannot use batched Direct Get. Such a stream still
+/// works; replay is only slower.
+pub(super) fn warn_once_without_direct_get(
+    ctx: &StreamContext,
+    jetstream: &jetstream::Context,
+    info: &nats_stream::Info,
+) {
+    if let Some(warning) = direct_get_warning(
+        &ctx.direct_get_checked,
+        &ctx.server,
+        &jetstream.client().server_info().version,
+        &ctx.stream_name,
+        info.config.allow_direct,
+    ) {
+        warn!("{warning}");
+    }
+}
+
+/// The warning of [warn_once_without_direct_get], unless `checked` says that
+/// it was already considered.
+fn direct_get_warning(
+    checked: &AtomicBool,
+    server: &str,
+    version: &str,
+    stream_name: &str,
+    allow_direct: bool,
+) -> Option<String> {
+    if checked.swap(true, Ordering::AcqRel) {
+        return None;
+    }
+    let mut reasons = Vec::new();
+    match parse_version(version) {
+        Some(have) if have >= DIRECT_BATCH_VERSION => {}
+        Some(_) => reasons.push(format!(
+            "the nats-server at {server} reports version {version}, and batched Direct Get needs nats-server 2.11 or later"
+        )),
+        None => reasons.push(format!(
+            "the nats-server at {server} reports version {version:?}, which the connector cannot parse, and batched Direct Get needs nats-server 2.11 or later"
+        )),
+    }
+    if !allow_direct {
+        reasons.push(format!(
+            "stream '{stream_name}' has `allow_direct` disabled (`nats stream edit {stream_name} --allow-direct` turns it on)"
+        ));
+    }
+    (!reasons.is_empty()).then(|| {
+        format!(
+            "Replay of stream '{stream_name}' cannot use batched Direct Get: {}. After a failure, the pipeline's replay will read each message from the stream leader, one request at a time, which is slower.",
+            reasons.join("; ")
+        )
+    })
+}
+
+/// The first nats-server version with batched Direct Get.
+const DIRECT_BATCH_VERSION: (u64, u64) = (2, 11);
+
+/// The major and minor version of a `nats-server` version string.
+fn parse_version(version: &str) -> Option<(u64, u64)> {
     let mut parts = version
         .trim_start_matches('v')
         .split(|c: char| !c.is_ascii_digit())
         .map(|part| part.parse::<u64>().ok());
-    match (parts.next().flatten(), parts.next().flatten()) {
-        (Some(have_major), Some(have_minor)) => (have_major, have_minor) >= (major, minor),
-        _ => false,
-    }
+    Some((parts.next().flatten()?, parts.next().flatten()?))
+}
+
+/// Whether a `nats-server` version string is at least `major.minor`.
+fn version_at_least(version: &str, minimum: (u64, u64)) -> bool {
+    parse_version(version).is_some_and(|have| have >= minimum)
 }
 
 #[cfg(test)]
@@ -810,6 +875,66 @@ mod tests {
             "{error}"
         );
         assert!(verify_step(&(3..10), Some(3), &[]).is_err());
+    }
+
+    fn warning_for(version: &str, allow_direct: bool) -> Option<String> {
+        direct_get_warning(
+            &AtomicBool::new(false),
+            "nats://n1:4222",
+            version,
+            "orders",
+            allow_direct,
+        )
+    }
+
+    #[test]
+    fn no_warning_when_replay_can_use_direct_get() {
+        assert_eq!(warning_for("2.11.0", true), None);
+        assert_eq!(warning_for("v2.15.2", true), None);
+    }
+
+    #[test]
+    fn warns_about_a_stream_without_allow_direct() {
+        let warning = warning_for("2.15.2", false).unwrap();
+        assert!(
+            warning.contains("stream 'orders' has `allow_direct` disabled")
+                && warning.contains("`nats stream edit orders --allow-direct`")
+                && warning
+                    .contains("from the stream leader, one request at a time, which is slower"),
+            "{warning}"
+        );
+        assert!(!warning.contains("2.11 or later"), "{warning}");
+    }
+
+    #[test]
+    fn warns_about_a_server_without_batched_direct_get() {
+        let warning = warning_for("2.10.24", true).unwrap();
+        assert!(
+            warning.contains(
+                "reports version 2.10.24, and batched Direct Get needs nats-server 2.11 or later"
+            ),
+            "{warning}"
+        );
+        assert!(!warning.contains("allow_direct"), "{warning}");
+
+        let warning = warning_for("unknown", true).unwrap();
+        assert!(
+            warning.contains(r#"reports version "unknown", which the connector cannot parse"#),
+            "{warning}"
+        );
+
+        // Both reasons.
+        let warning = warning_for("2.10.0", false).unwrap();
+        assert!(warning.contains("2.11 or later") && warning.contains("--allow-direct"));
+    }
+
+    /// One warning per connector open, however many steps it replays.
+    #[test]
+    fn warns_once() {
+        let checked = AtomicBool::new(false);
+        let warn = || direct_get_warning(&checked, "nats://n1:4222", "2.15.2", "orders", false);
+        assert!(warn().is_some());
+        assert_eq!(warn(), None);
     }
 
     #[test]

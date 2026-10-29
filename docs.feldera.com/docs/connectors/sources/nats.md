@@ -35,7 +35,12 @@ consumer:
   any replica of the stream. The connector checks that the answer is complete
   (every message names the one before it) and comes from the stream itself.
 - On older servers, and on streams without `allow_direct`, it reads the
-  messages from the stream leader with `STREAM.MSG.GET`.
+  messages from the stream leader with `STREAM.MSG.GET`, one request per
+  message, which is slower. The connector accepts such streams, but logs a
+  warning once each time it opens that names the reason: the nats-server
+  version (shown as reported, including a version it cannot parse), or
+  `allow_direct` being off. `nats stream edit <stream> --allow-direct` turns
+  it on.
 - When a Direct Get request fails, or its answer is incomplete or does not
   match the step (a replica may lag behind the leader), the connector reads
   the step again from the stream leader. The metric
