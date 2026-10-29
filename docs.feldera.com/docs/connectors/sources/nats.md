@@ -34,10 +34,15 @@ consumer:
   `allow_direct`), each request returns up to 512 messages of a subject from
   any replica of the stream. The connector checks that the answer is complete
   (every message names the one before it) and comes from the stream itself.
-- Otherwise, and whenever a Direct Get answer is incomplete or does not match
-  the step (a replica may lag behind the leader), it reads the messages from
-  the stream leader instead. The metric
-  `input_connector_nats_replay_leader_fallbacks_total` counts these fallbacks.
+- On older servers, and on streams without `allow_direct`, it reads the
+  messages from the stream leader with `STREAM.MSG.GET`.
+- When a Direct Get request fails, or its answer is incomplete or does not
+  match the step (a replica may lag behind the leader), the connector reads
+  the step again from the stream leader. The metric
+  `input_connector_nats_replay_leader_fallbacks_total` counts only these
+  fallbacks, not the steps that are read from the leader from the start.
+  Steps of a `LastPerSubject` snapshot are read one message at a time, and
+  their fallbacks are not counted.
 
 The connector fetches and checks every message of a step before it feeds any
 of them to the pipeline, so a replay that fails or is retried never ingests
@@ -250,6 +255,67 @@ The NATS connector supports the standard NATS authentication methods through
 the `auth` object. Configure exactly one method: `credentials`, `jwt` (with
 `nkey`), `nkey`, `token`, or `user_and_password`. Configuring more than one
 is rejected.
+
+### Permissions
+
+The connector makes these requests. Each `<stream>` is the configured
+`stream_name`; each `<consumer>` is the name of one of the connector's own
+consumers (see [Consumer lifecycle](#consumer-lifecycle)).
+
+| Publish to | Used for |
+|------------|----------|
+| `$JS.API.STREAM.INFO.<stream>` | Checking the stream (identity, available sequences) before reading, during health checks, and before each replayed step |
+| `$JS.API.CONSUMER.CREATE.<stream>.<consumer>` | Creating the pull consumer it reads with |
+| `$JS.API.CONSUMER.MSG.NEXT.<stream>.<consumer>` | Pulling messages |
+| `$JS.API.CONSUMER.INFO.<stream>.<consumer>` | Health checks while no message arrives, and checks after a reconnect or a consumer create that timed out |
+| `$JS.API.CONSUMER.DELETE.<stream>.<consumer>` | Deleting its consumers |
+| `$JS.API.STREAM.MSG.GET.<stream>` | Replay from the stream leader, and moving the position past messages it does not read while idle |
+| `$JS.API.DIRECT.GET.<stream>` | Replay with Direct Get |
+
+Replies, pulled messages, and Direct Get answers arrive on the client's inbox,
+so the user also needs permission to subscribe to `_INBOX.>`. The connector
+always uses the default inbox prefix `_INBOX`. It does not acknowledge
+messages and does not use `$JS.API.INFO`.
+
+Consumer names are `<prefix>_<uuid>`, one token, so the consumer subjects need
+the `*` wildcard. NATS wildcards match whole tokens only, so they cannot be
+narrowed to the connector's prefix: the user can manage any consumer of the
+stream.
+
+For example, for a stream `orders`:
+
+```text
+authorization {
+  users = [
+    {
+      user: feldera
+      password: <password>
+      permissions: {
+        publish: {
+          allow: [
+            "$JS.API.STREAM.INFO.orders",
+            "$JS.API.STREAM.MSG.GET.orders",
+            "$JS.API.DIRECT.GET.orders",
+            "$JS.API.CONSUMER.CREATE.orders.*",
+            "$JS.API.CONSUMER.INFO.orders.*",
+            "$JS.API.CONSUMER.DELETE.orders.*",
+            "$JS.API.CONSUMER.MSG.NEXT.orders.*"
+          ]
+        }
+        subscribe: {
+          allow: ["_INBOX.>"]
+        }
+      }
+    }
+  ]
+}
+```
+
+Without `$JS.API.DIRECT.GET.<stream>`, replay still works, but every replayed
+step first waits for its Direct Get request to fail and is then read from the
+stream leader. Without `$JS.API.STREAM.MSG.GET.<stream>`, a replay that cannot
+use Direct Get fails and is retried, and a connector with `filter_subjects`
+cannot move its position past other subjects' messages.
 
 ### Credentials File Authentication
 
