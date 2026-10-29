@@ -24,8 +24,21 @@ Source edition can be found on github.
     was paused, and `LastPerSubject` replays exactly its snapshot.
   - Resuming after the messages that the pipeline already read expired or
     were purged no longer fails.
-  - `rate_limit`, and `LastPerSubject` without `filter_subjects`, are now
-    rejected when the connector opens.
+  - Incompatible change: two configurations are now rejected when the
+    connector opens, instead of failing or misbehaving later:
+    - A `rate_limit` other than 0. NATS applies a rate limit only to push
+      consumers, and the connector reads with a pull consumer. Remove
+      `rate_limit`.
+    - `deliver_policy: LastPerSubject` without `filter_subjects`. NATS
+      delivers the last message of each subject only to a consumer with a
+      filter subject. Add `filter_subjects`, for example `[">"]` for every
+      subject.
+  - Recommended: turn on `allow_direct` on the JetStream stream (nats-server
+    2.11 or later), for example with
+    `nats stream edit <stream> --allow-direct`. Replay then reads up to 512
+    messages per batched Direct Get request. Without it, or on older servers,
+    replay reads each message from the stream leader with one request per
+    message, which is slower, and the connector logs a warning.
   - New metric `input_connector_nats_replay_leader_fallbacks_total`.
 
 - Experimental (Enterprise, Kubernetes): a resize of `memory_max` with

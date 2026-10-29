@@ -60,8 +60,12 @@ fails the replay with a fatal error.
   retention, the server may discard a message as soon as the connector has
   read it, before a checkpoint covers it, and then the pipeline cannot replay
   it after a crash. The connector logs a warning for such streams.
-- `allow_direct: true` (the default of `nats stream add`), so that replay can
-  use Direct Get.
+- `allow_direct: true` (the default of `nats stream add`; turn it on for an
+  existing stream with `nats stream edit <stream> --allow-direct`) on
+  nats-server 2.11 or later, so that replay can use batched Direct Get.
+  Without it, the connector still works, but replay reads each message from
+  the stream leader with one request per message, which is slower, and the
+  connector logs a warning when it opens (see [Replay](#replay)).
 - Keep messages (`max_age`, `max_msgs`, `max_bytes`) for longer than the
   pipeline can take between checkpoints, plus the time it may be stopped.
 
@@ -97,7 +101,7 @@ The connector configuration consists of three main sections:
 | `description`     | string                  | No       | Consumer description |
 | `filter_subjects` | string list             | No       | Filter messages by subject(s). If empty, consumes all subjects in the stream. The subjects may not overlap |
 | `replay_policy`   | variant                 | No       | Message replay speed: `"Instant"` (default, fast) or `"Original"` (rate-limited at original timing) |
-| `rate_limit`      | integer                 | No       | Not supported: NATS limits the rate only of push consumers, and the connector reads with a pull consumer. A value other than 0 is rejected |
+| `rate_limit`      | integer                 | No       | Not supported: NATS limits the rate only of push consumers, and the connector reads with a pull consumer. A value other than 0 is rejected when the connector opens; remove `rate_limit` |
 | `deliver_policy`  | variant                 | Yes      | Starting point for reading from the stream (see [Deliver Policy](#deliver-policy)) |
 | `max_waiting`     | integer                 | No       | Maximum outstanding pull requests. Default: 0 |
 | `metadata`        | map (string → string)   | No       | Consumer metadata key-value pairs |
@@ -112,7 +116,7 @@ The `deliver_policy` field determines where in the stream to start consuming mes
 - `"All"` - Start from the earliest available message in the stream
 - `"Last"` - Start from the last message in the stream
 - `"New"` - Start from new messages only (messages arriving after the connector first starts)
-- `"LastPerSubject"` - Start with the last message of each subject (useful for KV-like workloads), then read every newer message. Requires `filter_subjects` (use `[">"]` for all subjects). If the connector has to recreate its consumer before it has read the whole snapshot, it takes a new snapshot
+- `"LastPerSubject"` - Start with the last message of each subject (useful for KV-like workloads), then read every newer message. Requires `filter_subjects`, because NATS delivers the last message per subject only to a consumer with a filter subject; without it, the connector is rejected when it opens. Use `[">"]` for all subjects. If the connector has to recreate its consumer before it has read the whole snapshot, it takes a new snapshot
 - `{"ByStartSequence": {"start_sequence": 100}}` - Start from a specific sequence number
 - `{"ByStartTime": {"start_time": "2024-01-01T12:00:00Z"}}` - Start from messages at or after the specified timestamp (RFC 3339 format)
 
