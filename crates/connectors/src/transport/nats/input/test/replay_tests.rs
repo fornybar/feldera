@@ -693,3 +693,68 @@ pub fn filtered_position_behind_removed_messages_is_fatal(engine: &dyn Connector
     )
     .unwrap();
 }
+
+/// A stream deleted and restored from a backup of the same messages while
+/// the connector reads it: the connector continues where it was, without
+/// reading anything twice, although the restore may give the stream a new
+/// creation time.
+#[engine_test(services(Nats))]
+pub fn exact_restore_while_reading_continues(engine: &dyn ConnectorTestEngine) {
+    use NatsMockAction::*;
+    run_nats_mock_test(
+        engine,
+        |nats_url| fast_retry_config(nats_url, json!({})),
+        &[
+            StartNats,
+            CreateStream,
+            Publish(3),
+            CreatePipeline,
+            Extend,
+            WaitForRecords(3),
+            BackupStream,
+            DeleteStream,
+            RestoreStream,
+            Publish(2),
+            WaitForRecordsNoFatal(5),
+            QueueFor(Duration::from_secs(2)),
+            AssertNoFatalError,
+            AssertRecordCount(5),
+            VerifyRecords {
+                output_index: 0,
+                count: 5,
+            },
+            DisconnectAllowNonFatal,
+        ],
+    )
+    .unwrap();
+}
+
+/// A journaled step whose last message the stream now holds with another
+/// timestamp, as after a restore from an older backup and new publishes,
+/// fails the replay, and nothing of it reaches the circuit.
+#[engine_test(services(Nats))]
+pub fn replay_of_step_with_other_last_message_is_fatal(engine: &dyn ConnectorTestEngine) {
+    use NatsMockAction::*;
+    run_nats_mock_test(
+        engine,
+        basic_nats_config,
+        &[
+            StartNats,
+            CreateStream,
+            Publish(3),
+            CreatePipeline,
+            ReplayStep(json!({
+                "sequence_numbers": {"start": 1, "end": 4},
+                "messages": 3,
+                "last_ingested": {"sequence": 3, "timestamp": "1"},
+            })),
+            ExpectFatalErrorContains {
+                timeout: Duration::from_secs(10),
+                needle: "is not the stream this pipeline read before: its message 3 was stored",
+            },
+            AssertRecordCount(0),
+            DisconnectAllowNonFatal,
+        ],
+    )
+    .unwrap();
+}

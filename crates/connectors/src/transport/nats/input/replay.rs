@@ -23,8 +23,8 @@
 //! the circuit the same records twice.
 
 use super::{
-    ConnectorError, Metadata, StreamContext, StreamState, check_stream_identity, connect,
-    fetch_stream_info,
+    ConnectorError, Metadata, StreamContext, StreamState, check_anchor, check_stream_identity,
+    connect, fetch_stream_info,
 };
 use anyhow::{Result as AnyResult, anyhow, bail};
 use async_nats::{
@@ -61,6 +61,9 @@ const EXACT_FETCH_CONCURRENCY: usize = 16;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct ReplayMessage {
     pub sequence: u64,
+    /// When the server stored the message, in nanoseconds since the Unix
+    /// epoch; see [super::Anchor].
+    pub timestamp: i128,
     pub payload: Bytes,
 }
 
@@ -105,22 +108,52 @@ impl ReplaySource {
 
     /// Reads exactly the messages of the step that `metadata` describes.
     ///
-    /// `stream_created` is the identity of the stream the pipeline read
-    /// before, if known; it is recorded if not.
+    /// `stream_created` is the creation time of the stream the pipeline
+    /// read before, if known; it is recorded if not. The stream must be the
+    /// same one: if the step records its last message, the replayed last
+    /// message must be that message (see [super::verify_stream_identity]),
+    /// and otherwise the stream must have the recorded creation time.
     pub async fn fetch_step(
         &self,
         ctx: &StreamContext,
         metadata: &Metadata,
         stream_created: &mut Option<String>,
     ) -> Result<Vec<ReplayMessage>, ConnectorError> {
-        let range = &metadata.sequence_numbers;
         let info = fetch_stream_info(&self.jetstream, &self.stream_name).await?;
-        if let Some(recorded) = &metadata.stream_created {
-            check_stream_identity(&mut Some(recorded.clone()), &info, &self.stream_name)?;
-        }
-        check_stream_identity(stream_created, &info, &self.stream_name)?;
         warn_once_without_direct_get(ctx, &self.jetstream, &info);
-        validate_replay_range(&StreamState::from(&info), &self.stream_name, range)?;
+        let last = metadata.sequence_numbers.end.checked_sub(1);
+        let anchor = metadata
+            .last_ingested
+            .as_ref()
+            .filter(|anchor| Some(anchor.sequence) == last);
+        if anchor.is_none() {
+            if let Some(recorded) = &metadata.stream_created {
+                check_stream_identity(&mut Some(recorded.clone()), &info, &self.stream_name)?;
+            }
+            check_stream_identity(stream_created, &info, &self.stream_name)?;
+        }
+        let messages = self.read_step(ctx, metadata, &info).await?;
+        if let (Some(anchor), Some(message)) = (anchor, messages.last()) {
+            check_anchor(
+                anchor,
+                message.timestamp,
+                &info,
+                stream_created,
+                &self.stream_name,
+            )?;
+        }
+        Ok(messages)
+    }
+
+    /// Reads exactly the messages of the step that `metadata` describes.
+    async fn read_step(
+        &self,
+        ctx: &StreamContext,
+        metadata: &Metadata,
+        info: &nats_stream::Info,
+    ) -> Result<Vec<ReplayMessage>, ConnectorError> {
+        let range = &metadata.sequence_numbers;
+        validate_replay_range(&StreamState::from(info), &self.stream_name, range)?;
         let direct = self.server_batches && info.config.allow_direct;
 
         if let Some(sequences) = &metadata.sequences {
@@ -434,9 +467,20 @@ impl<'a> BatchDecoder<'a> {
                 if sequence < self.start || sequence <= self.previous {
                     bail!("message {sequence} is out of order");
                 }
+                let timestamp = header(headers, "Nats-Time-Stamp")?;
+                let timestamp = chrono::DateTime::parse_from_rfc3339(timestamp)
+                    .ok()
+                    .and_then(|time| time.timestamp_nanos_opt())
+                    .ok_or_else(|| {
+                        anyhow!("header `Nats-Time-Stamp` is {timestamp:?}, not an RFC 3339 time")
+                    })?;
                 self.pending = Some(number(headers, "Nats-Num-Pending")?);
                 self.previous = sequence;
-                self.messages.push(ReplayMessage { sequence, payload });
+                self.messages.push(ReplayMessage {
+                    sequence,
+                    timestamp: timestamp.into(),
+                    payload,
+                });
                 Ok(None)
             }
             204 if description == Some("EOB") => {
@@ -533,11 +577,12 @@ pub(super) async fn first_unread(
 fn replay_message(message: StreamMessage) -> ReplayMessage {
     ReplayMessage {
         sequence: message.sequence,
+        timestamp: message.time.unix_timestamp_nanos(),
         payload: message.payload,
     }
 }
 
-fn raw_message_error(error: jetstream::stream::RawMessageError) -> ConnectorError {
+pub(super) fn raw_message_error(error: jetstream::stream::RawMessageError) -> ConnectorError {
     match error.kind() {
         LastRawMessageErrorKind::JetStream(api_error)
             if super::config_utils::is_permanent_api_error(&api_error) =>
@@ -584,7 +629,7 @@ fn verify_step(
         && expected.is_none_or(|count| count == messages.len() as u64);
     if !complete {
         bail!(
-            "the pipeline ingested {ingested}, but the stream now has {} of them: messages were deleted, purged, or removed by a retention limit after the pipeline ingested them",
+            "the pipeline ingested {ingested}, but the stream now has {} of them: messages were deleted, purged, or removed by a retention limit after the pipeline ingested them, or the stream was restored from a backup older than what the pipeline ingested",
             found(messages)
         );
     }
@@ -723,9 +768,23 @@ mod tests {
                 ("Nats-Sequence", &sequence.to_string()),
                 ("Nats-Last-Sequence", &last.to_string()),
                 ("Nats-Num-Pending", &pending.to_string()),
+                ("Nats-Time-Stamp", &time(sequence)),
             ])),
             Bytes::from(format!("m{sequence}")),
         )
+    }
+
+    /// The time the test stream stored message `sequence`.
+    fn time(sequence: u64) -> String {
+        format!("2026-10-29T12:00:00.{sequence:09}Z")
+    }
+
+    fn nanos(sequence: u64) -> i128 {
+        chrono::DateTime::parse_from_rfc3339(&time(sequence))
+            .unwrap()
+            .timestamp_nanos_opt()
+            .unwrap()
+            .into()
     }
 
     fn eob(decoder: &mut BatchDecoder, last: u64, pending: u64) -> AnyResult<Option<Batch>> {
@@ -743,6 +802,7 @@ mod tests {
     fn message(sequence: u64) -> ReplayMessage {
         ReplayMessage {
             sequence,
+            timestamp: nanos(sequence),
             payload: Bytes::from(format!("m{sequence}")),
         }
     }
@@ -799,6 +859,7 @@ mod tests {
                     ("Nats-Sequence", "1"),
                     ("Nats-Last-Sequence", "0"),
                     ("Nats-Num-Pending", "1"),
+                    ("Nats-Time-Stamp", &time(1)),
                 ])),
                 Bytes::new(),
             )

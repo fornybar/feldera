@@ -42,9 +42,13 @@
 //! complete takes a new snapshot rather than reading every message from its
 //! position on.
 //!
-//! The stream's creation time is recorded too. A stream that was deleted and
-//! recreated under the same name numbers its messages from 1 again, so the
-//! recorded sequences would silently point at different messages.
+//! Each step also records which stream its sequences refer to: the stream's
+//! creation time, and the sequence and storage time of the last message the
+//! pipeline ingested. A stream that was deleted and recreated under the same
+//! name numbers its messages from 1 again, and a stream restored from a backup
+//! older than what the pipeline ingested reuses the sequences of the lost
+//! messages for new ones, so the recorded sequences would silently point at
+//! different messages. See [verify_stream_identity].
 //!
 //! # Replay
 //!
@@ -67,7 +71,10 @@ use async_nats::jetstream::{
     self,
     consumer::{self as nats_consumer, pull::MessagesErrorKind},
     context::GetStreamErrorKind,
-    stream::{self as nats_stream, ConsumerCreateStrictErrorKind, RetentionPolicy},
+    stream::{
+        self as nats_stream, ConsumerCreateStrictErrorKind, LastRawMessageErrorKind,
+        RetentionPolicy,
+    },
 };
 use chrono::Utc;
 use config_utils::{
@@ -92,7 +99,7 @@ use serde_json::Value as JsonValue;
 use std::hash::Hasher;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::{
     select,
@@ -195,6 +202,33 @@ struct Metadata {
     /// step, so a resumed connector must take a snapshot again.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     last_per_subject_pending: bool,
+
+    /// The last message the pipeline ingested up to the end of the step: the
+    /// step's last message, or for a step without messages, the one before.
+    /// See [verify_stream_identity].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_ingested: Option<Anchor>,
+}
+
+/// A message the connector ingested, identified by its stream sequence and
+/// by the time the server stored it, in nanoseconds since the Unix epoch.
+///
+/// Another stream, or the same stream restored from an older backup and then
+/// written to again, has another message at the same sequence, stored at
+/// another time. A restore of the same data keeps the message's time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Anchor {
+    sequence: u64,
+    timestamp: String,
+}
+
+impl Anchor {
+    fn new(sequence: u64, timestamp: i128) -> Self {
+        Self {
+            sequence,
+            timestamp: timestamp.to_string(),
+        }
+    }
 }
 
 impl Metadata {
@@ -213,6 +247,8 @@ enum Queued {
     /// The parsed contents of the message with this stream sequence.
     Message {
         sequence: u64,
+        /// When the server stored the message; see [Anchor].
+        timestamp: i128,
         /// Part of a `LastPerSubject` snapshot.
         snapshot: bool,
     },
@@ -240,7 +276,10 @@ struct ReaderState {
     snapshot_read: Arc<AtomicBool>,
     /// See [Metadata::stream_created]. Set before a reader queues anything,
     /// so that every step with messages records it.
-    stream_created: Arc<OnceLock<String>>,
+    stream_created: Arc<Mutex<Option<String>>>,
+    /// The last message a reader queued, which the next reader's stream must
+    /// still have; see [verify_stream_identity].
+    last_read: Arc<Mutex<Option<Anchor>>>,
 }
 
 /// The worker's view of what reached the circuit.
@@ -249,6 +288,8 @@ struct Position {
     flushed_end: u64,
     /// See [Metadata::stream_created].
     stream_created: Option<String>,
+    /// See [Metadata::last_ingested].
+    last_ingested: Option<Anchor>,
     /// See [Metadata::last_per_subject_pending].
     snapshot_pending: bool,
     /// The configured deliver policy is `LastPerSubject`.
@@ -260,6 +301,7 @@ impl Position {
         let mut position = Self {
             flushed_end: 0,
             stream_created: None,
+            last_ingested: None,
             snapshot_pending: false,
             last_per_subject: matches!(
                 config.consumer_config.deliver_policy,
@@ -279,6 +321,9 @@ impl Position {
             || (self.last_per_subject && metadata.sequence_numbers.end == 0);
         if let Some(created) = &metadata.stream_created {
             self.stream_created = Some(created.clone());
+        }
+        if let Some(anchor) = &metadata.last_ingested {
+            self.last_ingested = Some(anchor.clone());
         }
     }
 }
@@ -548,7 +593,8 @@ impl NatsReader {
             queue: Arc::new(InputQueue::new(consumer.clone())),
             healthy: Arc::new(AtomicBool::new(false)),
             snapshot_read: Arc::new(AtomicBool::new(false)),
-            stream_created: Arc::new(OnceLock::new()),
+            stream_created: Arc::new(Mutex::new(None)),
+            last_read: Arc::new(Mutex::new(None)),
         };
 
         match Self::replay_steps(
@@ -565,9 +611,8 @@ impl NatsReader {
                 live_state
                     .next_sequence
                     .store(position.flushed_end, Ordering::Release);
-                if let Some(created) = position.stream_created.clone() {
-                    let _ = live_state.stream_created.set(created);
-                }
+                *live_state.stream_created.lock().unwrap() = position.stream_created.clone();
+                *live_state.last_read.lock().unwrap() = position.last_ingested.clone();
             }
             ReplayOutcome::Stopped => return Ok(()),
         }
@@ -778,11 +823,13 @@ impl NatsReader {
             match queued {
                 Queued::Message {
                     sequence,
+                    timestamp,
                     snapshot: in_snapshot,
                 } => {
                     sequences.push(*sequence);
                     snapshot |= in_snapshot;
                     advance = advance.max(sequence + 1);
+                    position.last_ingested = Some(Anchor::new(*sequence, *timestamp));
                 }
                 Queued::SnapshotComplete => position.snapshot_pending = false,
                 Queued::Advance(sequence) => advance = advance.max(*sequence),
@@ -802,8 +849,9 @@ impl NatsReader {
             sequence_numbers,
             messages: (!sequences.is_empty()).then_some(sequences.len() as u64),
             sequences: snapshot.then_some(sequences),
-            stream_created: state.stream_created.get().cloned(),
+            stream_created: state.stream_created.lock().unwrap().clone(),
             last_per_subject_pending: position.snapshot_pending,
+            last_ingested: position.last_ingested.clone(),
         };
         let timestamp = entries.last().map(|(ts, _)| *ts).unwrap_or_else(Utc::now);
         let hash = hasher.map(|h| h.finish()).unwrap_or(0);
@@ -984,7 +1032,8 @@ async fn start_reader(
     cancel: CancellationToken,
 ) -> Result<Box<Reader>, ConnectorError> {
     let cancelled = || ConnectorError::Retryable(anyhow!("the start of the reader was cancelled"));
-    let mut stream_created = state.stream_created.get().cloned();
+    let mut stream_created = state.stream_created.lock().unwrap().clone();
+    let last_read = state.last_read.lock().unwrap().clone();
     let next_sequence = state.next_sequence.load(Ordering::Acquire);
     let prepare = async {
         let jetstream = connect(&ctx).await.map_err(|error| {
@@ -997,7 +1046,14 @@ async fn start_reader(
             ))
         })?;
         let info = fetch_stream_info(&jetstream, &ctx.stream_name).await?;
-        check_stream_identity(&mut stream_created, &info, &ctx.stream_name)?;
+        verify_stream_identity(
+            &jetstream,
+            &ctx.stream_name,
+            &info,
+            &mut stream_created,
+            last_read.as_ref(),
+        )
+        .await?;
         replay::warn_once_without_direct_get(&ctx, &jetstream, &info);
         if info.config.retention != RetentionPolicy::Limits {
             warn!(
@@ -1085,7 +1141,7 @@ async fn start_reader(
 
     let stream_created = stream_created.expect("the stream identity is known after checking it");
     // Before the reader queues anything; see [ReaderState::stream_created].
-    let _ = state.stream_created.set(stream_created.clone());
+    *state.stream_created.lock().unwrap() = Some(stream_created.clone());
     let task = tokio::spawn(
         read_messages(
             ReaderContext {
@@ -1524,8 +1580,12 @@ async fn read_messages(
             }
             Ok(Some(Ok(message))) => message,
         };
-        let (stream_sequence, delivery) = match message.info() {
-            Ok(info) => (info.stream_sequence, info.consumer_sequence),
+        let (stream_sequence, delivery, timestamp) = match message.info() {
+            Ok(info) => (
+                info.stream_sequence,
+                info.consumer_sequence,
+                info.published.unix_timestamp_nanos(),
+            ),
             Err(error) => {
                 return Err(ConnectorError::Retryable(anyhow!(
                     "message from consumer '{consumer_name}' has malformed metadata: {error}"
@@ -1549,9 +1609,11 @@ async fn read_messages(
                 Utc::now(),
                 Queued::Message {
                     sequence: stream_sequence,
+                    timestamp,
                     snapshot: in_snapshot,
                 },
             );
+            *state.last_read.lock().unwrap() = Some(Anchor::new(stream_sequence, timestamp));
             state
                 .next_sequence
                 .store(stream_sequence + 1, Ordering::Release);
@@ -1578,11 +1640,15 @@ async fn check_health(
     stream_created: &str,
 ) -> Result<u64, ConnectorError> {
     let info = fetch_stream_info(jetstream, &ctx.stream_name).await?;
-    check_stream_identity(
-        &mut Some(stream_created.to_string()),
-        &info,
-        &ctx.stream_name,
-    )?;
+    if stream_identity(&info) != stream_created {
+        // Replaced, or restored from a backup: the next reader finds out
+        // which, from the messages.
+        return Err(ConnectorError::Retryable(anyhow!(
+            "stream '{}' now has creation time {}, so it was replaced or restored from a backup; checking it again",
+            ctx.stream_name,
+            info.created
+        )));
+    }
     jetstream
         .get_consumer_from_stream::<nats_consumer::Config, _, _>(consumer_name, &ctx.stream_name)
         .await
@@ -1685,8 +1751,78 @@ fn stream_identity(info: &nats_stream::Info) -> String {
     info.created.unix_timestamp_nanos().to_string()
 }
 
-/// Checks that the stream is the one the connector read before, if any, and
-/// records it otherwise.
+/// Checks that the stream is the one the connector read before, and records
+/// its creation time in `recorded`.
+///
+/// `last_ingested` is the last message the connector ingested, if any. While
+/// the stream still has a message at that sequence, the message decides,
+/// because a restore from a backup can give the stream a new creation time
+/// (nats-server 2.15 always does, and so do clustered restores on some
+/// earlier versions): the same message means the same stream, another
+/// message means another stream, or the stream restored from an older backup
+/// and written to since. Otherwise the creation time decides.
+async fn verify_stream_identity(
+    jetstream: &jetstream::Context,
+    stream_name: &str,
+    info: &nats_stream::Info,
+    recorded: &mut Option<String>,
+    last_ingested: Option<&Anchor>,
+) -> Result<(), ConnectorError> {
+    if let Some(anchor) = last_ingested {
+        let stream = jetstream
+            .get_stream_no_info(stream_name)
+            .await
+            .map_err(|error| ConnectorError::Fatal(error.into()))?;
+        match stream.get_raw_message(anchor.sequence).await {
+            Ok(message) => {
+                return check_anchor(
+                    anchor,
+                    message.time.unix_timestamp_nanos(),
+                    info,
+                    recorded,
+                    stream_name,
+                );
+            }
+            Err(error) if error.kind() == LastRawMessageErrorKind::NoMessageFound => {}
+            Err(error) => return Err(replay::raw_message_error(error)),
+        }
+    }
+    check_stream_identity(recorded, info, stream_name)
+}
+
+/// Checks the message that the stream holds at the sequence of `anchor`, a
+/// message the connector ingested, which the server stored at `timestamp`.
+/// See [verify_stream_identity].
+fn check_anchor(
+    anchor: &Anchor,
+    timestamp: i128,
+    info: &nats_stream::Info,
+    recorded: &mut Option<String>,
+    stream_name: &str,
+) -> Result<(), ConnectorError> {
+    if anchor.timestamp != timestamp.to_string() {
+        return Err(ConnectorError::Fatal(anyhow!(
+            "Stream '{stream_name}' is not the stream this pipeline read before: its message {} was stored {timestamp} ns after the Unix epoch, but the message {} that the pipeline ingested was stored {} ns after the epoch. The stream was deleted and recreated, or restored from a backup older than what the pipeline ingested and then written to, so the recorded sequence numbers no longer identify the messages the pipeline ingested. To read the stream from the start, reset the connector, for example by changing its configuration",
+            anchor.sequence,
+            anchor.sequence,
+            anchor.timestamp
+        )));
+    }
+    let actual = stream_identity(info);
+    if let Some(previous) = recorded.as_ref()
+        && *previous != actual
+    {
+        info!(
+            "Stream '{stream_name}' has a new creation time ({}), as after a restore from a backup, but it still holds message {} that the pipeline ingested, unchanged, so the connector continues",
+            info.created, anchor.sequence
+        );
+    }
+    *recorded = Some(actual);
+    Ok(())
+}
+
+/// Checks that the stream has the creation time that `expected` recorded, if
+/// any, and records it otherwise.
 fn check_stream_identity(
     expected: &mut Option<String>,
     info: &nats_stream::Info,
@@ -1695,7 +1831,7 @@ fn check_stream_identity(
     let actual = stream_identity(info);
     match expected {
         Some(expected) if *expected != actual => Err(ConnectorError::Fatal(anyhow!(
-            "Stream '{stream_name}' is not the stream this pipeline read before: it was created at {}, but the pipeline's checkpoint and journal refer to a stream created {} ns after the Unix epoch. A stream that is deleted and recreated numbers its messages from 1 again, so the recorded sequence numbers no longer identify the messages the pipeline ingested. To read the new stream from the start, reset the connector, for example by changing its configuration",
+            "Stream '{stream_name}' is not the stream this pipeline read before: it was created at {}, but the pipeline's checkpoint and journal refer to a stream created {} ns after the Unix epoch, and the stream no longer has the last message the pipeline ingested, which would show whether it holds the same messages. A stream that is deleted and recreated numbers its messages from 1 again, and a restore from a backup can change the creation time, so the recorded sequence numbers may no longer identify the messages the pipeline ingested. To read the stream from the start, reset the connector, for example by changing its configuration",
             info.created,
             expected
         ))),

@@ -237,6 +237,11 @@ pub(crate) enum NatsMockAction {
         name: &'static str,
         value: f64,
     },
+    /// Back up the stream with the JetStream snapshot API.
+    BackupStream,
+    /// Restore the stream from the backup that `BackupStream` took. The
+    /// stream must not exist.
+    RestoreStream,
 }
 
 /// Internal state held by the test runner.
@@ -257,6 +262,8 @@ struct NatsMockRunner<'a> {
     got_fatal: Arc<AtomicBool>,
     error_count: Arc<AtomicUsize>,
     proxy: Option<JetStreamProxy>,
+    /// The backup that `BackupStream` took.
+    backup: Option<util::StreamBackup>,
     rt: tokio::runtime::Runtime,
 }
 
@@ -277,6 +284,7 @@ impl<'a> NatsMockRunner<'a> {
             got_fatal: Arc::new(AtomicBool::new(false)),
             error_count: Arc::new(AtomicUsize::new(0)),
             proxy: None,
+            backup: None,
             rt: tokio::runtime::Runtime::new()?,
         })
     }
@@ -1092,6 +1100,20 @@ impl<'a> NatsMockRunner<'a> {
             NatsMockAction::AssertCustomMetric { name, value } => {
                 let actual = self.mock_input_consumer().custom_metric(name);
                 assert_eq!(actual, Some(*value), "metric {name}");
+            }
+
+            NatsMockAction::BackupStream => {
+                let nats_url = self.nats_url().to_string();
+                self.backup = Some(
+                    self.rt
+                        .block_on(util::backup_stream(&nats_url, STREAM_NAME))?,
+                );
+            }
+
+            NatsMockAction::RestoreStream => {
+                let nats_url = self.nats_url().to_string();
+                let backup = self.backup.as_ref().expect("BackupStream first");
+                self.rt.block_on(util::restore_stream(&nats_url, backup))?;
             }
 
             NatsMockAction::AssertNoFatalError => {

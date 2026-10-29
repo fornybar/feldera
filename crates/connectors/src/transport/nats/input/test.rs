@@ -366,6 +366,99 @@ pub mod util {
         Ok(())
     }
 
+    /// A backup of a stream, as `nats stream backup` takes it: the stream's
+    /// configuration and state, and the chunks of its snapshot.
+    pub struct StreamBackup {
+        config: serde_json::Value,
+        state: serde_json::Value,
+        chunks: Vec<bytes::Bytes>,
+    }
+
+    /// Sends a JetStream API request and fails on an API error.
+    async fn api_request(
+        client: &Client,
+        subject: String,
+        payload: bytes::Bytes,
+    ) -> AnyResult<serde_json::Value> {
+        let reply = client.request(subject.clone(), payload).await?;
+        let reply: serde_json::Value = serde_json::from_slice(&reply.payload)?;
+        if let Some(error) = reply.get("error") {
+            return Err(anyhow!("{subject} failed: {error}"));
+        }
+        Ok(reply)
+    }
+
+    /// Backs up `stream` with the JetStream snapshot API.
+    pub async fn backup_stream(nats_url: &str, stream: &str) -> AnyResult<StreamBackup> {
+        use futures::StreamExt;
+        let client = wait_for_nats_ready(nats_url, Duration::from_secs(5)).await?;
+        let inbox = client.new_inbox();
+        let mut chunks_sub = client.subscribe(inbox.clone()).await?;
+        let reply = api_request(
+            &client,
+            format!("$JS.API.STREAM.SNAPSHOT.{stream}"),
+            serde_json::json!({"deliver_subject": inbox, "no_consumers": true})
+                .to_string()
+                .into(),
+        )
+        .await?;
+        let mut chunks = Vec::new();
+        loop {
+            let chunk = tokio::time::timeout(Duration::from_secs(10), chunks_sub.next())
+                .await?
+                .ok_or_else(|| anyhow!("snapshot of stream '{stream}' ended early"))?;
+            if chunk.payload.is_empty() {
+                // The end of the snapshot: `204` (or no status, when the
+                // whole snapshot fit in its first chunk), or an error.
+                match chunk.status.map(|status| status.as_u16()) {
+                    None | Some(204) => break,
+                    status => {
+                        return Err(anyhow!(
+                            "snapshot of stream '{stream}' failed: {status:?} {:?}",
+                            chunk.description
+                        ));
+                    }
+                }
+            }
+            chunks.push(chunk.payload);
+            if let Some(ack) = chunk.reply {
+                client.publish(ack, bytes::Bytes::new()).await?;
+            }
+        }
+        Ok(StreamBackup {
+            config: reply["config"].clone(),
+            state: reply["state"].clone(),
+            chunks,
+        })
+    }
+
+    /// Restores a stream from `backup` with the JetStream restore API, as
+    /// `nats stream restore` does. The stream must not exist.
+    pub async fn restore_stream(nats_url: &str, backup: &StreamBackup) -> AnyResult<()> {
+        let client = wait_for_nats_ready(nats_url, Duration::from_secs(5)).await?;
+        let name = backup.config["name"]
+            .as_str()
+            .ok_or_else(|| anyhow!("the backup has no stream name"))?;
+        let reply = api_request(
+            &client,
+            format!("$JS.API.STREAM.RESTORE.{name}"),
+            serde_json::json!({"config": backup.config, "state": backup.state})
+                .to_string()
+                .into(),
+        )
+        .await?;
+        let deliver = reply["deliver_subject"]
+            .as_str()
+            .ok_or_else(|| anyhow!("restore of stream '{name}' has no deliver subject: {reply}"))?
+            .to_string();
+        for chunk in &backup.chunks {
+            client.request(deliver.clone(), chunk.clone()).await?;
+        }
+        // An empty chunk ends the restore and returns its result.
+        api_request(&client, deliver, bytes::Bytes::new()).await?;
+        Ok(())
+    }
+
     /// Lists the consumers that currently exist on `stream`, as seen by the
     /// server.
     pub async fn list_consumers(

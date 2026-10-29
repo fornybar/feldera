@@ -19,7 +19,9 @@ Source edition can be found on github.
   - The connector reads with its own pull consumer instead of the client
     library's ordered consumer, which could restart a consumer from the
     beginning of the stream and ingest it twice.
-  - A stream that was deleted and recreated under the same name is detected.
+  - A stream that was deleted and recreated under the same name, or restored
+    from a backup older than the pipeline's checkpoint and written to since,
+    is detected. A stream restored from an up-to-date backup is accepted.
   - `New` and `Last` no longer skip messages published while the connector
     was paused, and `LastPerSubject` replays exactly its snapshot.
   - Resuming after the messages that the pipeline already read expired or

@@ -157,10 +157,22 @@ Only transient I/O failures during these validation checks are retried. Once the
 
 Typical fatal scenarios include:
 
-- **Stream deleted and recreated**: a recreated stream numbers its messages
-  from 1 again. The connector records the creation time of the stream it
-  reads, and fails with "is not the stream this pipeline read before" when it
-  finds a different one, even if the sequence numbers would fit.
+- **Stream deleted and recreated, or restored from an older backup**: a
+  recreated stream numbers its messages from 1 again, and a stream restored
+  from a backup taken before the pipeline's checkpoint has lost messages that
+  the pipeline ingested; new messages then reuse their sequence numbers. The
+  connector records the sequence and storage time of the last message it
+  ingested, and the creation time of the stream. It fails with "is not the
+  stream this pipeline read before" when the stream holds another message at
+  that sequence, or, if the stream no longer has that sequence at all, when
+  the creation time differs.
+
+A stream restored from a backup of the same messages, or a later backup, is
+the same stream to the connector: it resumes and replays from it, even though
+the restore can give the stream a new creation time (nats-server 2.15 does,
+as do clustered restores on some earlier versions). If retention has also
+removed the last message the pipeline ingested, the connector cannot tell a
+restored stream from a new one and fails.
 - **Unread messages removed**: the stream no longer has messages that the
   pipeline has not read yet (a retention limit, a purge, or a delete removed
   them), so continuing would silently skip them. Removing messages that the
