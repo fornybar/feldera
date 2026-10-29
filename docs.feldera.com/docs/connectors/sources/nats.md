@@ -20,7 +20,10 @@ tolerance](/pipelines/fault-tolerance).
   arrives, it checks every `inactivity_timeout` that the stream (still the same
   one) and its consumer exist.
 - **Exactly-once semantics**: each pipeline step records the range of stream
-  sequences it ingested, the number of messages, and the stream's identity.
+  sequences it ingested, the number of messages, and the stream's identity
+  (the storage time of the last message it ingested, and the stream's
+  creation time; see
+  [Backing up and restoring the stream](#backing-up-and-restoring-the-stream)).
   After a crash, the pipeline replays the steps after its last checkpoint by
   reading exactly those messages back by sequence (see
   [Replay](#replay)), then continues from where they end.
@@ -161,18 +164,8 @@ Typical fatal scenarios include:
   recreated stream numbers its messages from 1 again, and a stream restored
   from a backup taken before the pipeline's checkpoint has lost messages that
   the pipeline ingested; new messages then reuse their sequence numbers. The
-  connector records the sequence and storage time of the last message it
-  ingested, and the creation time of the stream. It fails with "is not the
-  stream this pipeline read before" when the stream holds another message at
-  that sequence, or, if the stream no longer has that sequence at all, when
-  the creation time differs.
-
-A stream restored from a backup of the same messages, or a later backup, is
-the same stream to the connector: it resumes and replays from it, even though
-the restore can give the stream a new creation time (nats-server 2.15 does,
-as do clustered restores on some earlier versions). If retention has also
-removed the last message the pipeline ingested, the connector cannot tell a
-restored stream from a new one and fails.
+  connector fails with "is not the stream this pipeline read before". See
+  [Backing up and restoring the stream](#backing-up-and-restoring-the-stream).
 - **Unread messages removed**: the stream no longer has messages that the
   pipeline has not read yet (a retention limit, a purge, or a delete removed
   them), so continuing would silently skip them. Removing messages that the
@@ -193,6 +186,85 @@ forever, because the data needed to maintain exactly-once guarantees is permanen
 To recover from a fatal error caused by stream data loss, you typically need to
 reset the pipeline's checkpoint state (e.g., by recreating the pipeline) so it
 starts fresh without referencing the now-invalid sequence numbers.
+:::
+
+### Backing up and restoring the stream
+
+A pipeline's checkpoint refers to messages by their stream sequence number.
+After a stream is restored from a backup (for example with
+`nats stream backup` and `nats stream restore`, which use the JetStream
+snapshot API), the connector must tell whether the restored stream still holds
+the messages that the pipeline ingested, or whether sequence numbers now
+belong to other messages.
+
+**How the connector identifies the stream.** Each pipeline step records the
+sequence of the last message the connector ingested and the time the NATS
+server stored that message. Storage times are part of the stored message, so a
+restore keeps them. Before the connector reads after startup or resume, and
+when it replays a step, it fetches the message at that sequence:
+
+- Same storage time: it is the same stream, and the connector continues.
+- Another storage time: the stream holds another message at that sequence.
+  The connector fails with "is not the stream this pipeline read before".
+- The sequence is gone (retention or a purge removed it): the connector falls
+  back to the stream's creation time, which it also records. If the creation
+  time differs, it fails with the same error.
+
+A restore while the pipeline is reading makes the connector report a
+non-fatal error and check the stream again, as above, before it continues.
+
+**What works:**
+
+- Restoring a backup that holds every message the pipeline ingested, up to its
+  latest checkpoint and the steps journaled after it: an exact backup, or one
+  taken later. The pipeline resumes from its checkpoint and replays its
+  journaled steps without skipping or duplicating messages, on any server
+  version, even when the restore gives the stream a new creation time.
+- Restoring such a backup while the pipeline is running. The pipeline
+  continues after a non-fatal error, without duplicates.
+- Leader changes and restarts of the NATS cluster. They do not change the
+  stream's identity.
+
+**What does not work:**
+
+- Restoring a backup taken before the pipeline's latest checkpoint or
+  journaled steps. The pipeline has ingested messages that the restored
+  stream does not have. Whether or not new messages were published since and
+  reused their sequence numbers, the connector fails with a fatal error
+  instead of skipping the new messages or ingesting data twice.
+- Messages that were published after the backup and before the restore, and
+  that the pipeline had not read yet, are lost with the restore. The
+  connector cannot detect this.
+- A restored stream whose last ingested message was also removed by retention
+  or a purge, on a server where the restore changes the creation time (see
+  the table below). The connector cannot tell such a stream from a new one and
+  fails with a fatal error, although the restore was correct.
+- Copies of a stream made in other ways than with a backup (mirrors, sources,
+  republishing) are not tested. The connector accepts such a copy only if the
+  message at the recorded sequence has the same storage time.
+
+Whether a restore keeps the stream's creation time depends on the
+nats-server version (measured with `nats stream backup`, deleting the
+stream, and `nats stream restore`). The connector does not rely on it unless
+the last ingested message is gone:
+
+| nats-server | Single server | Cluster (R3) |
+|-------------|---------------|--------------|
+| 2.11.12     | kept          | new          |
+| 2.14.9      | kept          | kept         |
+| 2.15.2      | new           | new          |
+
+To recover from a fatal error after a restore, reset the pipeline's
+checkpoint state, as described in
+[Recovery from fatal errors](#retry-startup-and-replay-behavior).
+
+:::tip Recommendations for backups
+- Back up and restore with `nats stream backup` and `nats stream restore`.
+- Restore only a backup that is at least as new as the pipeline's latest
+  checkpoint and journaled steps. A backup taken after the pipeline stopped
+  meets this.
+- Keep the stream's retention long enough that the last message the pipeline
+  ingested is still in the stream when the pipeline resumes.
 :::
 
 ### Retry backoff

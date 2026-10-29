@@ -19,9 +19,24 @@ Source edition can be found on github.
   - The connector reads with its own pull consumer instead of the client
     library's ordered consumer, which could restart a consumer from the
     beginning of the stream and ingest it twice.
-  - A stream that was deleted and recreated under the same name, or restored
-    from a backup older than the pipeline's checkpoint and written to since,
-    is detected. A stream restored from an up-to-date backup is accepted.
+  - Stream backup and restore: each step now also records the sequence and
+    storage time of the last message the connector ingested, and the
+    connector identifies the stream by that message instead of only by the
+    stream's creation time.
+    - A stream restored from a backup that holds every message the pipeline
+      ingested (an exact or later backup) is accepted: the pipeline resumes
+      and replays from it. Before, this failed on nats-server 2.15, whose
+      restore gives the stream a new creation time.
+    - A stream restored from a backup older than the pipeline's checkpoint,
+      or deleted and recreated under the same name, fails with a fatal error.
+      Before, an older backup followed by new publishes that reused the lost
+      sequence numbers could make the connector skip the new messages.
+    - Not detected: unread messages published after the backup are lost with
+      the restore. A correct restore still fails if retention also removed
+      the last ingested message and the restore changed the creation time.
+      See [Backing up and restoring the stream](/connectors/sources/nats#backing-up-and-restoring-the-stream).
+    - Checkpoints written by earlier versions still load; they are checked by
+      the stream's creation time until the next step records a message.
   - `New` and `Last` no longer skip messages published while the connector
     was paused, and `LastPerSubject` replays exactly its snapshot.
   - Resuming after the messages that the pipeline already read expired or
