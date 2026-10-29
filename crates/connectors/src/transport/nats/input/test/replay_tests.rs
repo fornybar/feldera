@@ -515,3 +515,181 @@ pub fn replay_feeds_every_record_of_a_message(engine: &dyn ConnectorTestEngine) 
         .unwrap();
     }
 }
+
+/// Explicitly listed sequences are read from the stream leader when the
+/// stream has no `allow_direct`, and a listed message that is gone fails the
+/// replay.
+#[engine_test(services(Nats))]
+pub fn replay_of_listed_sequences_reads_from_leader(engine: &dyn ConnectorTestEngine) {
+    use NatsMockAction::*;
+    for (deleted, outcome) in [
+        (None, VerifySequences(&[1, 3])),
+        (
+            Some(3),
+            ExpectFatalErrorContains {
+                timeout: Duration::from_secs(10),
+                needle: "Cannot replay message 3 of stream 'str'",
+            },
+        ),
+    ] {
+        let mut actions = vec![
+            StartNats,
+            CreateStreamWith {
+                subjects: &["sub.*"],
+                allow_direct: false,
+            },
+            PublishTo {
+                subject: "sub.a",
+                count: 1,
+            },
+            PublishTo {
+                subject: "sub.b",
+                count: 1,
+            },
+            PublishTo {
+                subject: "sub.b",
+                count: 1,
+            },
+        ];
+        actions.extend(deleted.map(DeleteMessage));
+        actions.extend([
+            CreatePipeline,
+            ReplayStep(json!({
+                "sequence_numbers": {"start": 1, "end": 4},
+                "messages": 2,
+                "sequences": [1, 3],
+            })),
+        ]);
+        if deleted.is_none() {
+            actions.push(WaitForReplayedRecords(2));
+        }
+        actions.extend([outcome, DisconnectAllowNonFatal]);
+        run_nats_mock_test(
+            engine,
+            |nats_url| {
+                config_with_consumer(
+                    nats_url,
+                    json!({"deliver_policy": "LastPerSubject", "filter_subjects": ["sub.*"]}),
+                )
+            },
+            &actions,
+        )
+        .unwrap();
+    }
+}
+
+/// `LastPerSubject` on subjects without messages has an empty snapshot and
+/// reads what comes next.
+#[engine_test(services(Nats))]
+pub fn last_per_subject_with_empty_snapshot_reads_new_messages(engine: &dyn ConnectorTestEngine) {
+    use NatsMockAction::*;
+    run_nats_mock_test(
+        engine,
+        |nats_url| {
+            config_with_consumer(
+                nats_url,
+                json!({"deliver_policy": "LastPerSubject", "filter_subjects": ["sub.*"]}),
+            )
+        },
+        &[
+            StartNats,
+            CreateStreamWith {
+                subjects: &["sub.*", "other"],
+                allow_direct: true,
+            },
+            PublishTo {
+                subject: "other",
+                count: 1,
+            },
+            CreatePipeline,
+            Extend,
+            WaitForConsumerCount {
+                count: 1,
+                timeout: CONSUMER_COUNT_TIMEOUT,
+            },
+            PublishTo {
+                subject: "sub.a",
+                count: 2,
+            },
+            WaitForRecords(2),
+            QueueFor(Duration::from_millis(300)),
+            VerifySequences(&[2, 3]),
+            Disconnect,
+        ],
+    )
+    .unwrap();
+}
+
+/// A consumer the server refuses (here, start sequence 0 for
+/// `ByStartSequence`) fails the connector instead of retrying forever.
+#[engine_test(services(Nats))]
+pub fn rejected_consumer_is_fatal(engine: &dyn ConnectorTestEngine) {
+    use NatsMockAction::*;
+    run_nats_mock_test(
+        engine,
+        |nats_url| {
+            config_with_consumer(
+                nats_url,
+                json!({"deliver_policy": {"ByStartSequence": {"start_sequence": 0}}}),
+            )
+        },
+        &[
+            StartNats,
+            CreateStream,
+            CreatePipeline,
+            Extend,
+            ExpectFatalErrorContains {
+                timeout: Duration::from_secs(10),
+                needle: "Failed to create consumer",
+            },
+            DisconnectAllowNonFatal,
+        ],
+    )
+    .unwrap();
+}
+
+/// While paused, a filtered connector does not move past other subjects'
+/// messages. If retention removes them meanwhile, it cannot tell that none
+/// was on its subjects, fails rather than risk skipping data, and says why.
+#[engine_test(services(Nats))]
+pub fn filtered_position_behind_removed_messages_is_fatal(engine: &dyn ConnectorTestEngine) {
+    use NatsMockAction::*;
+    run_nats_mock_test(
+        engine,
+        |nats_url| fast_retry_config(nats_url, json!({})),
+        &[
+            StartNats,
+            CreateStreamWith {
+                subjects: &["sub", "other"],
+                allow_direct: true,
+            },
+            Publish(1),
+            CreatePipeline,
+            Extend,
+            WaitForRecords(1),
+            Pause,
+            WaitForConsumerCount {
+                count: 0,
+                timeout: CONSUMER_COUNT_TIMEOUT,
+            },
+            PublishTo {
+                subject: "other",
+                count: 3,
+            },
+            PublishTo {
+                subject: "sub",
+                count: 1,
+            },
+            // Message 1 was read; 2 was not, and was on another subject.
+            DeleteMessage(1),
+            DeleteMessage(2),
+            Extend,
+            ExpectFatalErrorContains {
+                timeout: Duration::from_secs(10),
+                needle: "reads only some subjects of the stream",
+            },
+            DisconnectAllowNonFatal,
+        ],
+    )
+    .unwrap();
+}
